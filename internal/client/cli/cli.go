@@ -92,6 +92,8 @@ dispatch:
 	switch cmd {
 	case "get":
 		return cmdGet(cfg, g, cmdArgs)
+	case "repo":
+		return cmdRepo(cfg, g, cmdArgs)
 	case "env":
 		return cmdEnv(cfg, g, cmdArgs)
 	case "doctor":

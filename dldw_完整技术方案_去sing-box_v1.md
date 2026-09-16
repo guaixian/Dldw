@@ -387,3 +387,38 @@ eval $(dldw env)
 ```
 
 最终定位：dldw v1 是**低依赖、可审计、可回退的命令行下载加速层**：包装命令解决白名单可达，`dldw get` 解决大文件吞吐，服务端负责受控出口、缓存与对象存储直传。
+
+---
+
+## 14. 实施附记（v1.4，2026-09-16）
+
+原方案 §1–§13 已全部实现并通过测试（19+ 测试包、二进制级 E2E 冒烟）。以下记录与原设计的差异和超出部分。
+
+### 14.1 与原方案的差异
+
+| 原设计 | 实际实现 | 原因 |
+|---|---|---|
+| OpenList 管理文件索引/元数据 | OpenList 作为可选**存储驱动**（`storage.driver=openlist`，走 fs/get raw_url）而非索引层 | 部署面更小；元数据由任务存储承担 |
+| SQLite/PostgreSQL 存任务 | JSON 文件持久化（原子写+重启恢复） | 零依赖原则；接口留有替换空间 |
+| Docker Mirror 为可选独立组件 | 实现为 dldw 内嵌 Registry V2 拉穿（§14.2） | 单二进制交付，与共享存储打通 |
+| 错误码 `E_RESOLSE_TIMEOUT`（原文拼写） | 统一为 `E_RESOLVE_TIMEOUT` | 原方案 §7 已自我更正 |
+
+### 14.2 超出原方案的扩展
+
+- **内嵌代理核心**：`proxy.enabled` + hysteria2 分享链接 -> 托管 sing-box 子进程，executor/隧道出口自动接管（`upstream_proxy` 亦可直连指定既有代理）。
+- **拉穿镜像族**（共享存储与任务记录，任意入口命中即全入口秒下）：
+  - `/pypi/*`：simple 索引代理（HTML/PEP691 重写）+ wheel 缓存 302；
+  - `/npm/*`：registry 元数据代理 + tarball 缓存 302（写操作不走镜像）；
+  - `/gomod/*`：GOPROXY 协议（版本化文件永久缓存，list/sumdb 透传）；
+  - `/mirror/{scheme}/{host}/{path}`：通用静态拉穿（apt .deb / yum .rpm / 任意静态；**仓库元数据自动识别并透传**，防过期索引）；
+  - `/v2/*`：Docker Registry V2 拉穿（blob 按 digest 入库并**强制 SHA256 校验**；tag manifest 短 TTL / digest manifest 永久缓存；服务端统一持有 Hub 凭证绕开匿名限流）。
+- **镜像地址自动注入**：wrapper 探测 `/api/v1/capabilities`，对 uv/pip/npm/pnpm/yarn/go 在用户未自配时注入 `UV_INDEX_URL`/`PIP_INDEX_URL`/`NPM_CONFIG_REGISTRY`/`GOPROXY`；优先级 CLI flag > 环境变量 > 项目/用户配置文件 > 自动注入。
+- **`dldw repo <git-url>`**：git 快照的务实缓存路径——packfile 按协商生成不可缓存，但 codeload tarball 同 commit 内容恒定；命令自动转换+缓存+安全解包（路径穿越 fail-closed）。
+- **缓存分层结论**（修正"git/docker 不可缓存"的直觉）：HTTP 层不可缓存 ≠ 不可缓存；git 对象（tarball）与 Docker 层（digest 内容寻址）均为不可变内容，下沉一层即可缓存。
+
+### 14.3 已知边界
+
+- `/pypi /npm /mirror /gomod /v2` 默认无鉴权：仅监听 127.0.0.1 或置于可信网络。
+- Docker 冷拉取需 Hub 凭证（匿名 IP 限流常态）；客户端需 daemon.json registry-mirrors。
+- git 完整历史 clone 仍走隧道不缓存；bare mirror（`dldw git mirror`）留作进阶。
+- Maven/cargo/conda 可经 `/mirror/*` 手动接入，专用注入器未实现。

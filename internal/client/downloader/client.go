@@ -294,3 +294,20 @@ func (c *Client) RegisterToken(ctx context.Context, clientID string) (*TokenActi
 func (c *Client) Raw(ctx context.Context, method, path string, body any, out any) error {
 	return c.do(ctx, method, path, body, out)
 }
+
+// CapabilitiesResponse mirrors GET /api/v1/capabilities（wrapper 据此自动注入镜像）。
+type CapabilitiesResponse struct {
+	PyPI   bool `json:"pypi"`
+	NPM    bool `json:"npm"`
+	Mirror bool `json:"mirror"`
+	GoMod  bool `json:"gomod"`
+}
+
+// Capabilities 探测服务端开启了哪些拉穿镜像。
+func (c *Client) Capabilities(ctx context.Context) (*CapabilitiesResponse, error) {
+	var out CapabilitiesResponse
+	if err := c.do(ctx, http.MethodGet, "/api/v1/capabilities", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

@@ -33,6 +33,10 @@ tunnel:
   tls:                        # 生产环境必须启用（令牌/数据否则明文传输）
     cert: ""                  # 如 /etc/dldw/tls/tunnel-fullchain.pem
     key: ""                   # 如 /etc/dldw/tls/tunnel-privkey.pem
+  # upstream_proxy: http://127.0.0.1:10808
+  # 可选：隧道出口经上游 HTTP 代理（如 Xray/v2rayN 的 mixed 入站）出网。
+  # 启用后：目标 DNS/SSRF 判定委托给代理；域名白名单与端口策略仍本地强制，
+  # OK 应答的 resolved_ip 报 "-"。
   max_conns_per_token: 16     # 每个设备 token 的并发隧道连接上限
   max_bytes_per_conn: 256MiB  # 单连接字节上限；隧道不承载大文件（大文件走 dldw get）
   idle_timeout: 300s          # 空闲超时；同时作为握手 OK 应答里的 expires_in
@@ -40,10 +44,15 @@ tunnel:
 # ----------------------------------------------------------------------------
 # 对象存储（缓存工件存放处，spec 4.3）
 #
-# driver=localfs：本地磁盘 + HMAC 预签名 URL，由本进程 /files/ 提供 Range 下载。
-#                 自托管/开发简单，但缓存命中流量仍走 API 端口。
-# driver=s3    ：S3/MinIO/OSS SigV4 预签名直传，客户端直连对象存储，
-#                 缓存命中时 dldw 服务器零字节中转（生产推荐）。
+# driver=localfs（别名 fs）：本地磁盘 + HMAC 预签名 URL，由本进程 /files/
+#                 提供 Range 下载。自托管/开发简单，但缓存命中流量仍走 API 端口。
+# driver=s3     ：任何 S3 兼容后端的 SigV4 预签名直传——AWS S3、阿里云 OSS、
+#                 腾讯 COS、Cloudflare R2 等凡暴露 S3 API 的都用这一项；
+#                 客户端直连对象存储，缓存命中时 dldw 服务器零字节中转（生产推荐）。
+# driver=minio  ：等价于 s3，但强制 path_style=true（MinIO 寻址约定）。
+# driver=openlist：把 OpenList/AList 挂载当作存储（见下方 openlist 段）。
+#
+# 新增后端：实现 internal/transfer/storage.Storage 接口并在 app.go 注册。
 # ----------------------------------------------------------------------------
 storage:
   driver: localfs
@@ -54,14 +63,89 @@ storage:
                                     # 预签名 HMAC 密钥（>=16 字节）。
                                     # !! 生产必须换成随机值；泄露 = 任何人可下任意缓存对象
 
-  # --- s3 专用（driver 切换为 s3 时生效）---
+  # --- s3 / minio 专用（把 driver 切换为 s3 或 minio 时生效）---
   s3:
+    # MinIO 示例（或直接 driver: minio，自动 path_style=true）：
+    #   endpoint: http://minio.internal:9000
+    #   region: us-east-1
+    #   bucket: dldw-cache
+    #   access_key: minioadmin
+    #   secret_key: minioadmin
+    #   path_style: true
+    #
+    # AWS S3 示例：
+    #   endpoint: https://s3.us-east-1.amazonaws.com
+    #   region: us-east-1
+    #   bucket: dldw-cache
+    #   access_key: "AKIA..."
+    #   secret_key: "..."
+    #   path_style: false
+    #
+    # 阿里云 OSS / 腾讯 COS / Cloudflare R2：同 AWS 形式，填各自的
+    # S3 兼容 endpoint 与区域（R2 region 填 auto），path_style 按厂商文档。
     endpoint: https://s3.us-east-1.amazonaws.com
     region: us-east-1
     bucket: dldw-cache               # 建议专用桶，生命周期规则可配 TTL
     access_key: "AKIA..."            # AccessKey ID
     secret_key: "..."                # !! 仅写在服务端配置，不下发给客户端
     path_style: false                # MinIO/自建 = true；AWS 虚拟主机风格 = false
+
+  # --- openlist 专用（把 driver 切换为 openlist 时生效）---
+  # dldw 通过 OpenList 的 REST API 存取工件，下载链接用 fs/get 的 raw_url：
+  #   - OpenList 挂载的是 S3/云盘类驱动：raw_url 是底层直链/预签名 URL，
+  #     客户端直连底层存储下载，dldw 与 OpenList 都零中转；
+  #   - 挂载的是本地/WebDAV 类驱动：raw_url 是 OpenList 的 /d/ 代理地址，
+  #     字节经 OpenList 中转（Range 透传，分块下载照常工作）。
+  # 注意：客户端必须能访问 base_url（或其底层直链域名）；
+  #       raw_url 有效期由 OpenList/底层存储决定，客户端临期会自动 refresh。
+  openlist:
+    base_url: http://openlist.internal:5244   # OpenList 地址
+    token: ""            # 推荐填 OpenList 后台生成的 API token
+    username: admin      # token 留空时用账密登录（遇 401 自动重登）
+    password: ""
+    root_path: /dldw-cache   # OpenList 里的缓存根目录，建议独立目录
+    dir_password: ""     # 目录签名/访问密码，一般留空
+
+# ----------------------------------------------------------------------------
+# 内嵌代理核心（sing-box 子进程托管）：服务端自带出口，无需宿主机 v2rayN。
+# 启用后 executor 与隧道未显式配置 upstream_proxy 时自动指向核心的 mixed 入站。
+# 启动时临时禁用：dldw serve --no-proxy-core
+# ----------------------------------------------------------------------------
+proxy:
+  enabled: false                 # 是否启用服务端代理
+  core: sing-box
+  binary: /usr/local/bin/sing-box   # sing-box 可执行文件路径
+  share_link: "hysteria2://password@hy.example.com:32319?sni=hy.example.com&obfs=salamander&obfs-password=xxx#node"
+                                 # 目前支持 hysteria2:// 分享链接（含 hy2:// 前缀）
+  listen: 127.0.0.1
+  port: 1080                     # mixed 入站端口（dldw 内部使用）
+  log_level: warn
+
+# ----------------------------------------------------------------------------
+# PyPI 拉穿镜像：uv / pip 的包下载全量吃服务端缓存
+#   客户端无需手动配置——wrapper 检测到 uv/pip 且用户未自配 index 时自动注入：
+#     dldw uv sync / dldw pip install ...   （注入 UV_INDEX_URL / PIP_INDEX_URL）
+#   用户自己配置（CLI flag / 环境变量 / pyproject / pip.ini）优先，不会被覆盖。
+# ----------------------------------------------------------------------------
+pypi:
+  enabled: true
+  # index_origin: https://pypi.org    # 可指向私有 devpi/镜像
+  # files_origin: https://files.pythonhosted.org
+  # index_ttl: 10m                    # 索引页内存缓存 TTL
+
+# ----------------------------------------------------------------------------
+# npm 拉穿镜像：npm / pnpm / yarn 吃服务端缓存
+#   wrapper 检测到 npm 系命令且用户未自配 registry 时自动注入
+#   NPM_CONFIG_REGISTRY；publish/login 等写操作不走镜像。
+# ----------------------------------------------------------------------------
+npm:
+  enabled: true
+  # registry_origin: https://registry.npmjs.org
+  # index_ttl: 2m                     # 元数据内存缓存 TTL
+
+# ----------------------------------------------------------------------------
+# 网络其余部分
+# ----------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------
 # 源站抓取执行器：缓存未命中时由谁去下载原始 URL
@@ -70,6 +154,10 @@ executor:
   driver: builtin                   # builtin（默认，纯 Go，带重试）| aria2
   max_bytes: 8GiB                   # 单工件大小上限；超出直接拒绝（0 = 不限）
   ports: [80, 443]                  # 允许访问源站的端口白名单（SSRF 收敛）
+  # upstream_proxy: http://127.0.0.1:10808
+  # 可选：源站抓取全部经上游 HTTP 代理出网（如 Xray/v2rayN 的 mixed 入站，
+  # 需支持 HTTP 代理语义与 CONNECT）。启用后源站 DNS/SSRF 判定委托给代理，
+  # 端口白名单仍本地强制。代理不可用时抓取会失败重试直至 dead。
   allow_loopback: false             # !! 仅本地测试（源站在 127.0.0.1）时置 true；
                                     # !! 公网部署必须 false，否则可被抓取内网资源
 

@@ -19,6 +19,7 @@ import (
 	"dldw/internal/transfer/executor"
 	"dldw/internal/transfer/storage"
 	"dldw/internal/transfer/storage/localfs"
+	"dldw/internal/urlcanon"
 )
 
 func testEngine(t *testing.T, origin http.HandlerFunc) (*Engine, *httptest.Server) {
@@ -143,6 +144,7 @@ func TestResolveSingleflight(t *testing.T) {
 		<-release
 		fmt.Fprint(w, "data-1234567890")
 	})
+	url := artifactURLFor(srv)
 	const n = 8
 	var wg sync.WaitGroup
 	var ready, pending int32
@@ -150,7 +152,7 @@ func TestResolveSingleflight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := eng.Resolve(context.Background(), artifactURLFor(srv), "tok_t")
+			res, err := eng.Resolve(context.Background(), url, "tok_t")
 			if err != nil {
 				t.Error(err)
 				return
@@ -166,12 +168,35 @@ func TestResolveSingleflight(t *testing.T) {
 	close(release)
 	wg.Wait()
 
-	if hits != 1 {
-		t.Fatalf("origin hits = %d, want 1 (singleflight)", hits)
+	// fetch 由后台 goroutine 执行；等待任务 ready 且源站恰好命中一次。
+	// 加载重时 fetch 可能较慢，给足窗口再断言精确值。
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if tk, err := eng.Task(taskIDOf(t, eng, url)); err == nil && tk.Status == StatusReady {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("origin hits = %d, want exactly 1 (singleflight)", got)
 	}
 	if ready+pending != n {
 		t.Fatalf("ready=%d pending=%d", ready, pending)
 	}
+}
+
+// taskIDOf 找到 cache key 对应任务 ID（测试辅助）。
+func taskIDOf(t *testing.T, eng *Engine, url string) string {
+	t.Helper()
+	_, _, key, err := urlcanon.FamilyOfRaw(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk, err := eng.Store().GetByCacheKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tk.ID
 }
 
 func TestTaskRetryThenDead(t *testing.T) {

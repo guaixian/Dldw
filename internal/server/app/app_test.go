@@ -478,6 +478,59 @@ func TestLoadWhitelist(t *testing.T) {
 	}
 }
 
+// TestStorageDriverAliases 验证存储驱动别名：minio -> s3（强制 path_style）、
+// fs -> localfs、openlist 注册，未知驱动给出包含可选项的错误信息。
+func TestStorageDriverAliases(t *testing.T) {
+	dir := t.TempDir()
+
+	newWithDriver := func(driver string) (*App, error) {
+		cfg := Default(dir)
+		cfg.Storage.Driver = driver
+		switch driver {
+		case "minio", "s3":
+			cfg.Storage.S3 = S3Config{
+				Endpoint: "http://minio.test:9000", Region: "us-east-1",
+				Bucket: "b", AccessKeyID: "ak", SecretAccessKey: "sk",
+			}
+		case "openlist":
+			cfg.Storage.OpenList = OpenListConfig{BaseURL: "http://openlist.test:5244", Token: "tok"}
+		}
+		return New(cfg)
+	}
+
+	a, err := newWithDriver("minio")
+	if err != nil {
+		t.Fatalf("minio alias: %v", err)
+	}
+	if a.Storage.Name() != "s3" {
+		t.Fatalf("minio should map to the s3 driver, got %q", a.Storage.Name())
+	}
+
+	a2, err := newWithDriver("fs")
+	if err != nil {
+		t.Fatalf("fs alias: %v", err)
+	}
+	if a2.Storage.Name() != "localfs" {
+		t.Fatalf("fs should map to the localfs driver, got %q", a2.Storage.Name())
+	}
+
+	a3, err := newWithDriver("openlist")
+	if err != nil {
+		t.Fatalf("openlist driver: %v", err)
+	}
+	if a3.Storage.Name() != "openlist" {
+		t.Fatalf("openlist driver name = %q", a3.Storage.Name())
+	}
+	if a3.Local != nil {
+		t.Fatal("openlist driver must not mount the localfs /files/ handler")
+	}
+
+	_, err = newWithDriver("webdav")
+	if err == nil || !strings.Contains(err.Error(), "localfs | s3 | minio | openlist") {
+		t.Fatalf("unknown driver error should list options, got: %v", err)
+	}
+}
+
 // TestLoadAnnotatedExampleYAML 保证 deploy/server.example.yaml（带注释模板）
 // 始终能被正确解析——它是用户手改配置的第一入口。
 func TestLoadAnnotatedExampleYAML(t *testing.T) {

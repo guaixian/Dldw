@@ -270,11 +270,14 @@ func cmdProxy(cfg config.Config, g globals, args []string) int {
 	return 0
 }
 
-// cmdServe implements `dldw serve [--config FILE]`.
+// cmdServe implements `dldw serve [--config FILE] [--no-proxy-core]`。
+// --no-proxy-core 启动时禁用内嵌代理核心（覆盖 proxy.enabled）。
 func cmdServe(g globals, args []string) int {
 	configFile := ""
+	noCore := false
 	fs := newFlagSet("serve")
 	fs.StrVar(&configFile, "config", "")
+	fs.BoolVar(&noCore, "no-proxy-core", false)
 	first, _ := fs.Parse(args)
 	if configFile == "" && first != "" {
 		configFile = first
@@ -283,6 +286,9 @@ func cmdServe(g globals, args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dldw serve: %v\n", err)
 		return 2
+	}
+	if noCore {
+		cfg.Proxy.Enabled = false
 	}
 	if err := app.DefaultWhitelistFile(cfg.WhitelistFile); err != nil {
 		fmt.Fprintf(os.Stderr, "dldw serve: whitelist init: %v\n", err)

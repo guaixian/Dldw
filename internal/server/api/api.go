@@ -15,6 +15,8 @@ import (
 	"dldw/internal/policy/whitelist"
 	"dldw/internal/server/audit"
 	"dldw/internal/server/auth"
+	"dldw/internal/server/npm"
+	"dldw/internal/server/pypi"
 	"dldw/internal/server/ratelimit"
 	"dldw/internal/transfer/presign"
 	"dldw/internal/transfer/storage"
@@ -45,6 +47,19 @@ type Config struct {
 	IPRate       *ratelimit.Limiter // generic per-IP request limit
 	RegisterRate *ratelimit.Limiter // token registration per-IP
 	ResolveRate  *ratelimit.Count   // resolve/task creation per token
+
+	// PyPI 拉穿镜像（nil = 不挂载 /pypi/*）
+	PyPI       *pypi.Mirror
+	PyPIClient *http.Client // 索引抓取客户端（带出口代理）；nil = 直连
+	// npm 拉穿镜像（nil = 不挂载 /npm/*）
+	NPM        *npm.Mirror
+	NPMClient  *http.Client
+	// 通用静态文件拉穿镜像（apt/yum；nil = 不挂载 /mirror/*）
+	WebMirror http.Handler
+	// Go module proxy 镜像（nil = 不挂载 /gomod/*）
+	GoMod http.Handler
+	// Docker Registry V2 镜像（nil = 不挂载 /v2/*）
+	Registry http.Handler
 }
 
 // New builds the HTTP handler with all routes (spec 4.1):
@@ -99,6 +114,51 @@ func New(cfg Config) http.Handler {
 		mux.HandleFunc("GET /files/{key...}", cfg.handleFile)
 		mux.HandleFunc("HEAD /files/{key...}", cfg.handleFile)
 	}
+	if cfg.PyPI != nil {
+		// GET /pypi/simple/<pkg>/   索引代理（HTML/JSON 双格式，链接重写）
+		// GET /pypi/packages/<path> wheel -> 302 预签名（首次抓取入库）
+		simple := func(w http.ResponseWriter, r *http.Request) {
+			cfg.PyPI.ServeSimple(w, r, cfg.PyPIClient)
+		}
+		mux.HandleFunc("GET /pypi/simple/{pkg}", simple)
+		mux.HandleFunc("GET /pypi/simple/{pkg}/", simple)
+		mux.HandleFunc("GET /pypi/packages/{path...}", cfg.PyPI.ServePackage)
+	}
+	if cfg.NPM != nil {
+		// GET /npm/<pkg>            元数据代理（tarball 链接重写 + 内存缓存）
+		// GET /npm/tarball/<path>   tarball -> 302 预签名（首次抓取入库）
+		meta := func(w http.ResponseWriter, r *http.Request) {
+			cfg.NPM.ServeMetadata(w, r, cfg.NPMClient)
+		}
+		mux.HandleFunc("GET /npm/{pkg}", meta)
+		mux.HandleFunc("GET /npm/tarball/{path...}", cfg.NPM.ServeTarball)
+	}
+	if cfg.WebMirror != nil {
+		// GET /mirror/{scheme}/{host}/{path...}  apt(.deb)/yum(.rpm)/任意静态文件
+		mux.Handle("GET /mirror/{scheme}/{host}/{path...}", cfg.WebMirror)
+		mux.Handle("HEAD /mirror/{scheme}/{host}/{path...}", cfg.WebMirror)
+	}
+	if cfg.GoMod != nil {
+		// GET /gomod/{path...}  Go module proxy（版本化文件缓存，其余透传）
+		mux.Handle("GET /gomod/{path...}", cfg.GoMod)
+		mux.Handle("HEAD /gomod/{path...}", cfg.GoMod)
+	}
+	if cfg.Registry != nil {
+		// GET/HEAD /v2/...  Docker Registry V2 拉穿镜像（manifest 缓存 + blob 入库）
+		mux.Handle("/v2/", cfg.Registry)
+		mux.Handle("/v2", cfg.Registry)
+	}
+	// 能力探测（无鉴权）：客户端 wrapper 据此决定是否自动注入镜像地址
+	mux.HandleFunc("GET /api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"request_id": requestID(r),
+			"pypi":       cfg.PyPI != nil,
+			"npm":        cfg.NPM != nil,
+			"mirror":     cfg.WebMirror != nil,
+			"gomod":      cfg.GoMod != nil,
+			"registry":   cfg.Registry != nil,
+		})
+	})
 
 	return cfg.middleware(mux)
 }

@@ -1,0 +1,212 @@
+// Package npm 实现 npm registry 拉穿镜像（pull-through cache），让 npm /
+// pnpm / yarn 的包下载吃 dldw 服务端缓存：
+//
+//	GET /npm/<pkg>               代理 registry.npmjs.org 元数据（完整/精简
+//	                             corgi 两种格式），把 dist.tarball 链接重写为
+//	                             /npm/tarball/...（内存缓存，默认 2min）
+//	GET /npm/tarball/<pkg>/-/x   tgz 请求：命中 -> 302 预签名（本地直出）；
+//	                             未命中 -> 经出口代理抓取入库 -> 302
+//
+// 客户端接入（wrapper 自动注入，也可手动）：
+//	NPM_CONFIG_REGISTRY=http://127.0.0.1:18080/npm
+//
+// 与 `dldw get` / PyPI 镜像共享存储与任务记录。仅支持公共 registry 匿名
+// 拉取；带 _authToken 的私有源请勿指向本镜像。
+package npm
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"dldw/internal/server/mirrorcore"
+	"dldw/internal/transfer/executor"
+	"dldw/internal/transfer/storage"
+	"dldw/internal/transfer/tasks"
+	"dldw/internal/urlcanon"
+)
+
+// Config 配置镜像行为。
+type Config struct {
+	RegistryOrigin string // 默认 https://registry.npmjs.org
+	PublicBase     string // 对外基础 URL
+	IndexTTL       time.Duration
+	TmpDir         string
+	PresignTTL     time.Duration
+}
+
+func (c Config) withDefaults() Config {
+	if c.RegistryOrigin == "" {
+		c.RegistryOrigin = "https://registry.npmjs.org"
+	}
+	c.RegistryOrigin = strings.TrimRight(c.RegistryOrigin, "/")
+	if c.IndexTTL <= 0 {
+		c.IndexTTL = 2 * time.Minute
+	}
+	if c.PresignTTL <= 0 {
+		c.PresignTTL = 15 * time.Minute
+	}
+	return c
+}
+
+// Mirror 是 npm 拉穿镜像。
+type Mirror struct {
+	cfg   Config
+	fetch *mirrorcore.Fetcher
+	group *mirrorcore.Group
+
+	idxMu sync.Mutex
+	idx   map[string]idxEntry
+}
+
+type idxEntry struct {
+	body        []byte
+	contentType string
+	fetchedAt   time.Time
+}
+
+// New 构造镜像。
+func New(cfg Config, stor storage.Storage, exec executor.Executor, store *tasks.Store) *Mirror {
+	return &Mirror{
+		cfg:   cfg.withDefaults(),
+		fetch: &mirrorcore.Fetcher{Stor: stor, Exec: exec, Store: store, TmpDir: cfg.TmpDir, PresignTTL: cfg.PresignTTL},
+		group: mirrorcore.NewGroup(),
+		idx:   map[string]idxEntry{},
+	}
+}
+
+var pkgNameRe = func(s string) bool {
+	// 包名：裸名 或 @scope/name（URL 里可能是 %2F 编码）
+	s = strings.ReplaceAll(s, "%2F", "/")
+	if s == "" || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_', r == '@', r == '/':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ServeMetadata 处理 GET /npm/{pkg} —— 代理元数据并重写 tarball 链接。
+func (m *Mirror) ServeMetadata(w http.ResponseWriter, r *http.Request, upstream *http.Client) {
+	pkg := strings.Trim(r.PathValue("pkg"), "/")
+	if !pkgNameRe(pkg) {
+		http.Error(w, "invalid package name", http.StatusBadRequest)
+		return
+	}
+	// 归一化编码：@scope%2Fname -> @scope/name
+	pkgNorm := strings.ReplaceAll(pkg, "%2F", "/")
+
+	if body, ctype, ok := m.cachedMeta(pkgNorm); ok {
+		w.Header().Set("Content-Type", ctype)
+		w.Header().Set("X-Dldw-Cache", "hit")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+		return
+	}
+
+	if upstream == nil {
+		upstream = &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	}
+	// 元数据请求路径保留原始编码形式（npm 对 scope 包用 %2F）
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		m.cfg.RegistryOrigin+"/"+pkg, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Accept", r.Header.Get("Accept")) // 透传 corgi 精简格式协商
+	resp, err := upstream.Do(req)
+	if err != nil {
+		http.Error(w, "registry unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		http.Error(w, "read metadata: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	// 重写 tarball 链接：origin/<pkg>/-/ -> PublicBase/npm/tarball/<pkg>/-/
+	rewritten := strings.ReplaceAll(string(body),
+		m.cfg.RegistryOrigin+"/"+pkg+"/-/", m.cfg.PublicBase+"/npm/tarball/"+pkg+"/-/")
+	ctype := resp.Header.Get("Content-Type")
+	if ctype == "" {
+		ctype = "application/json"
+	}
+
+	m.idxMu.Lock()
+	m.idx[pkgNorm] = idxEntry{body: []byte(rewritten), contentType: ctype, fetchedAt: time.Now()}
+	m.idxMu.Unlock()
+
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("X-Dldw-Cache", "miss")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(rewritten))
+}
+
+func (m *Mirror) cachedMeta(pkg string) ([]byte, string, bool) {
+	m.idxMu.Lock()
+	defer m.idxMu.Unlock()
+	e, ok := m.idx[pkg]
+	if !ok || time.Since(e.fetchedAt) > m.cfg.IndexTTL {
+		return nil, "", false
+	}
+	return e.body, e.contentType, true
+}
+
+// ServeTarball 处理 GET /npm/tarball/{path...} —— tgz 缓存/302。
+func (m *Mirror) ServeTarball(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimPrefix(r.URL.Path, "/npm/tarball/")
+	p = strings.Trim(p, "/")
+	if p == "" || !strings.Contains(p, "/-/") || strings.Contains(p, "..") {
+		http.Error(w, "bad path", http.StatusBadRequest)
+		return
+	}
+	canonical := m.cfg.RegistryOrigin + "/" + p
+
+	target, err := m.serveTarball(r.Context(), canonical)
+	if err != nil {
+		code := http.StatusBadGateway
+		if strings.Contains(err.Error(), "HTTP 4") {
+			code = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	w.Header().Set("Location", target)
+	w.WriteHeader(http.StatusFound)
+}
+
+// serveTarball 返回预签名 URL；未命中则抓取入库。家族固定 npm-tarball，
+// 与真实 registry.npmjs.org URL 的分类一致，因此与 dldw get 共享 cache key。
+func (m *Mirror) serveTarball(ctx context.Context, canonicalURL string) (string, error) {
+	canonical, err := urlcanon.Canonicalize(canonicalURL)
+	if err != nil {
+		return "", err
+	}
+	v, _ := m.group.Do(canonical, func() (any, error) {
+		return m.fetch.PresignOrFetch(ctx, canonical, urlcanon.FamilyNpmTarball, "npm-mirror")
+	})
+	url, _ := v.(string)
+	if url == "" {
+		return "", fmt.Errorf("cache error")
+	}
+	return url, nil
+}

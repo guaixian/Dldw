@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,13 +21,21 @@ import (
 	"dldw/internal/server/api"
 	"dldw/internal/server/audit"
 	"dldw/internal/server/auth"
+	"dldw/internal/server/gomod"
+	"dldw/internal/server/npm"
+	"dldw/internal/server/proxycore"
+	"dldw/internal/server/pypi"
+	"dldw/internal/server/registrymirror"
 	"dldw/internal/server/tunnel"
+	"dldw/internal/server/webmirror"
 	"dldw/internal/transfer/aria2ctl"
 	"dldw/internal/transfer/executor"
 	"dldw/internal/transfer/storage"
 	"dldw/internal/transfer/storage/localfs"
+	"dldw/internal/transfer/storage/openliststore"
 	s3stor "dldw/internal/transfer/storage/s3"
 	"dldw/internal/transfer/tasks"
+	"dldw/internal/upstreamproxy"
 	"dldw/internal/version"
 )
 
@@ -40,16 +50,46 @@ type App struct {
 	Local   *localfs.Driver
 	Audit   *audit.Logger
 	Exec    executor.Executor
+	PyPI    *pypi.Mirror
+	NPM     *npm.Mirror
+	WebMirror *webmirror.Mirror
+	GoModM *gomod.Mirror
+	Registry *registrymirror.Mirror
 
-	apiServer  *http.Server
-	tunnelLn   net.Listener
-	tunnelSrv  *tunnel.Server
-	wlModTime  time.Time
+	coreLink *proxycore.ShareLink // 解析后的分享链接（proxy.enabled 时非空）
+	coreMgr  *proxycore.Manager
+
+	apiServer *http.Server
+	tunnelLn  net.Listener
+	tunnelSrv *tunnel.Server
+	wlModTime time.Time
 }
 
 // New builds all components from cfg.
 func New(cfg Config) (*App, error) {
 	a := &App{Cfg: cfg}
+
+	// 内嵌代理核心：解析分享链接；executor/隧道未显式配置 upstream 时自动接管
+	coreUpstream := ""
+	if cfg.Proxy.Enabled {
+		sl, perr := proxycore.ParseHysteria2(cfg.Proxy.ShareLink)
+		if perr != nil {
+			return nil, perr
+		}
+		if !strings.EqualFold(cfg.Proxy.Core, "sing-box") {
+			return nil, fmt.Errorf("proxy core %q not supported (want sing-box)", cfg.Proxy.Core)
+		}
+		coreUpstream = "http://" + net.JoinHostPort(cfg.Proxy.Listen, strconv.Itoa(cfg.Proxy.Port))
+		a.coreLink = sl
+		if cfg.Executor.UpstreamProxy == "" {
+			cfg.Executor.UpstreamProxy = coreUpstream
+			a.Cfg = cfg
+		}
+		if cfg.Tunnel.UpstreamProxy == "" {
+			cfg.Tunnel.UpstreamProxy = coreUpstream
+			a.Cfg = cfg
+		}
+	}
 
 	// audit
 	var w interface{ Write([]byte) (int, error) } = os.Stdout
@@ -79,9 +119,18 @@ func New(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("auth store: %w", err)
 	}
 
-	// storage
+	// storage 驱动选择（spec 4.3）：
+	//   localfs | fs          本地磁盘 + HMAC 预签名（/files/ 提供 Range 下载）
+	//   s3                     任何 S3 兼容后端的 SigV4 预签名直传
+	//                          （AWS S3、OSS/COS/R2 等凡暴露 S3 API 的均用此项）
+	//   minio                  同 s3，但强制 path_style=true（MinIO 布局约定）
+	//   openlist               OpenList/AList 挂载作为存储；下载链接用 fs/get
+	//                          的 raw_url：S3 类挂载=底层直链（零中转），
+	//                          本地/WebDAV 类挂载=OpenList /d/ 代理（中转）。
+	//
+	// 新增后端：实现 internal/transfer/storage.Storage 接口并在本 switch 注册。
 	switch strings.ToLower(cfg.Storage.Driver) {
-	case "", "localfs":
+	case "", "localfs", "fs":
 		d, derr := localfs.New(localfs.Config{
 			Root:       cfg.Storage.Root,
 			PublicBase: cfg.PublicBase,
@@ -93,21 +142,39 @@ func New(cfg Config) (*App, error) {
 		}
 		a.Local = d
 		a.Storage = d
-	case "s3":
+	case "s3", "minio":
+		sc := cfg.Storage.S3
+		if strings.EqualFold(cfg.Storage.Driver, "minio") {
+			sc.PathStyle = true // MinIO 用 path-style 寻址（bucket 在路径上）
+		}
 		d, derr := s3stor.New(s3stor.Config{
-			Endpoint:        cfg.Storage.S3.Endpoint,
-			Region:          cfg.Storage.S3.Region,
-			Bucket:          cfg.Storage.S3.Bucket,
-			AccessKeyID:     cfg.Storage.S3.AccessKeyID,
-			SecretAccessKey: cfg.Storage.S3.SecretAccessKey,
-			PathStyle:       cfg.Storage.S3.PathStyle,
+			Endpoint:        sc.Endpoint,
+			Region:          sc.Region,
+			Bucket:          sc.Bucket,
+			AccessKeyID:     sc.AccessKeyID,
+			SecretAccessKey: sc.SecretAccessKey,
+			PathStyle:       sc.PathStyle,
 		})
 		if derr != nil {
 			return nil, fmt.Errorf("s3: %w", derr)
 		}
 		a.Storage = d
+	case "openlist":
+		ol := cfg.Storage.OpenList
+		d, derr := openliststore.New(openliststore.Config{
+			BaseURL:     ol.BaseURL,
+			Token:       ol.Token,
+			Username:    ol.Username,
+			Password:    ol.Password,
+			RootPath:    ol.RootPath,
+			DirPassword: ol.DirPassword,
+		})
+		if derr != nil {
+			return nil, fmt.Errorf("openlist: %w", derr)
+		}
+		a.Storage = d
 	default:
-		return nil, fmt.Errorf("unknown storage driver %q", cfg.Storage.Driver)
+		return nil, fmt.Errorf("unknown storage driver %q (supported: localfs | s3 | minio | openlist; OSS/COS/R2 等 S3 兼容后端用 s3)", cfg.Storage.Driver)
 	}
 	a.Stor = a.Storage
 
@@ -119,13 +186,17 @@ func New(cfg Config) (*App, error) {
 	switch strings.ToLower(cfg.Executor.Driver) {
 	case "", "builtin":
 		maxBytes, _ := hunits.ParseBytes(cfg.Executor.MaxBytes)
+		if uerr := upstreamproxy.Validate(cfg.Executor.UpstreamProxy); uerr != nil {
+			return nil, fmt.Errorf("executor upstream_proxy: %w", uerr)
+		}
 		a.Exec = executor.NewBuiltin(executor.BuiltinConfig{
 			Policy: &ssrf.Policy{
 				BlockPrivate:  blockPrivate,
 				AllowLoopback: cfg.Executor.AllowLoopback,
 				Ports:         cfg.Executor.Ports,
 			},
-			MaxBytes: maxBytes,
+			MaxBytes:      maxBytes,
+			UpstreamProxy: cfg.Executor.UpstreamProxy,
 		})
 	case "aria2":
 		if cfg.Executor.Aria2.RPCURL == "" {
@@ -149,21 +220,151 @@ func New(cfg Config) (*App, error) {
 		PresignTTL: cfg.PresignTTLDuration(),
 	}, store, a.Exec, a.Storage, a.Audit)
 
+	// PyPI 拉穿镜像（pypi.enabled 时挂载 /pypi/*）
+	if cfg.PyPI.Enabled {
+		ttl, _ := hunits.ParseDuration(cfg.PyPI.IndexTTL)
+		a.PyPI = pypi.New(pypi.Config{
+			IndexOrigin: cfg.PyPI.IndexOrigin,
+			FilesOrigin: cfg.PyPI.FilesOrigin,
+			PublicBase:  cfg.PublicBase,
+			IndexTTL:    ttl,
+			TmpDir:      cfg.TmpDir,
+			PresignTTL:  cfg.PresignTTLDuration(),
+		}, a.Storage, a.Exec, a.Engine.Store())
+	}
+
+	// npm 拉穿镜像（npm.enabled 时挂载 /npm/*）
+	if cfg.NPM.Enabled {
+		ttl, _ := hunits.ParseDuration(cfg.NPM.IndexTTL)
+		a.NPM = npm.New(npm.Config{
+			RegistryOrigin: cfg.NPM.RegistryOrigin,
+			PublicBase:     cfg.PublicBase,
+			IndexTTL:       ttl,
+			TmpDir:         cfg.TmpDir,
+			PresignTTL:     cfg.PresignTTLDuration(),
+		}, a.Storage, a.Exec, a.Engine.Store())
+	}
+
+	// 通用静态文件拉穿镜像（mirror.enabled 时挂载 /mirror/*）
+	// 透传客户端：优先走服务端出口（内嵌核心/upstream_proxy），否则 SSRF 守卫直连
+	var passClient *http.Client
+	if a.Cfg.Executor.UpstreamProxy != "" {
+		if u, uerr := url.Parse(a.Cfg.Executor.UpstreamProxy); uerr == nil {
+			passClient = &http.Client{Transport: &http.Transport{
+				Proxy: http.ProxyURL(u),
+			}}
+		}
+	} else {
+		blockPrivate := true
+		if cfg.BlockPrivate != nil {
+			blockPrivate = *cfg.BlockPrivate
+		}
+		passClient = &http.Client{Transport: &http.Transport{
+			Proxy:       nil,
+			DialContext: (&ssrf.Policy{BlockPrivate: blockPrivate, Ports: []int{80, 443}}).DialContext,
+		}}
+	}
+	if cfg.Mirror.Enabled {
+		a.WebMirror = webmirror.New(webmirror.Config{
+			AllowedHosts: cfg.Mirror.AllowedHosts,
+		}, passClient, a.Storage, a.Exec, a.Engine.Store(), cfg.TmpDir, cfg.PresignTTLDuration())
+	}
+
+	// Go module proxy 镜像（gomod.enabled 时挂载 /gomod/*）
+	if cfg.GoMod.Enabled {
+		a.GoModM = gomod.New(gomod.Config{Origin: cfg.GoMod.Origin}, passClient,
+			a.Storage, a.Exec, a.Engine.Store(), cfg.TmpDir, cfg.PresignTTLDuration())
+	}
+
+	// Docker Registry V2 镜像（registry.enabled 时挂载 /v2/*）
+	if cfg.Registry.Enabled {
+		mttl, _ := hunits.ParseDuration(cfg.Registry.ManifestTTL)
+		a.Registry = registrymirror.New(registrymirror.Config{
+			Origin:       cfg.Registry.Origin,
+			AuthURL:      cfg.Registry.AuthURL,
+			Username:     cfg.Registry.Username,
+			Password:     cfg.Registry.Password,
+			ManifestTTL:  mttl,
+			TmpDir:       cfg.TmpDir,
+			PresignTTL:   cfg.PresignTTLDuration(),
+		}, passClient, a.Storage, a.Engine.Store())
+	}
+
 	return a, nil
 }
 
 // Handler returns the API HTTP handler (useful for tests).
 func (a *App) Handler() http.Handler {
+	// 镜像索引抓取客户端：跟随服务端出口（内嵌核心或显式 upstream_proxy）
+	var mirrorClient *http.Client
+	if up := a.Cfg.Executor.UpstreamProxy; up != "" {
+		if u, err := url.Parse(up); err == nil {
+			mirrorClient = &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					Proxy:               http.ProxyURL(u),
+					TLSHandshakeTimeout: 10 * time.Second,
+				},
+			}
+		}
+	}
 	return api.New(api.Config{
-		Engine:           a.Engine,
-		Tokens:           a.Tokens,
-		WL:               a.WLStore,
-		Stor:             a.Stor,
-		Local:            a.Local,
-		Audit:            a.Audit,
-		Version:          version.Version,
+		Engine:            a.Engine,
+		Tokens:            a.Tokens,
+		WL:                a.WLStore,
+		Stor:              a.Stor,
+		Local:             a.Local,
+		Audit:             a.Audit,
+		Version:           version.Version,
 		AllowRegistration: a.Cfg.Auth.AllowRegistration,
+		PyPI:              a.PyPI,
+		PyPIClient:        mirrorClient,
+		NPM:               a.NPM,
+		NPMClient:         mirrorClient,
+		WebMirror:         handlerOrNil(a.WebMirror),
+		GoMod:             handlerOrNil(a.GoModM),
+		Registry:          handlerOrNil(a.Registry),
 	})
+}
+
+// handlerOrNil 返回实现了 http.Handler 的镜像（或 nil）。
+func handlerOrNil(h http.Handler) http.Handler {
+	if h == nil {
+		return nil
+	}
+	return h
+}
+
+// startProxyCore 生成 sing-box 配置并托管其进程。
+func (a *App) startProxyCore() error {
+	cfg := a.Cfg.Proxy
+	if err := os.MkdirAll(cfg.ConfigDir, 0o755); err != nil {
+		return err
+	}
+	cfgJSON, err := proxycore.GenerateSingBoxConfig(a.coreLink, cfg.Listen, cfg.Port, cfg.LogLevel)
+	if err != nil {
+		return err
+	}
+	cfgPath := filepath.Join(cfg.ConfigDir, "sing-box.json")
+	if err := os.WriteFile(cfgPath, cfgJSON, 0o600); err != nil {
+		return err
+	}
+	logPath := filepath.Join(cfg.ConfigDir, "sing-box.log")
+	mgr, err := proxycore.Start(cfg.Binary, cfgPath, logPath)
+	if err != nil {
+		return err
+	}
+	addr := net.JoinHostPort(cfg.Listen, strconv.Itoa(cfg.Port))
+	if err := mgr.WaitReady(addr, 15*time.Second); err != nil {
+		mgr.Stop()
+		return err
+	}
+	a.coreMgr = mgr
+	a.Audit.Log("proxy_core_start", "", "core", cfg.Core, "listen", addr,
+		"server", a.coreLink.Server, "node", a.coreLink.Name)
+	fmt.Fprintf(os.Stderr, "dldw proxy core (sing-box) listening on %s -> %s:%d (%s)\n",
+		addr, a.coreLink.Server, a.coreLink.Port, a.coreLink.Name)
+	return nil
 }
 
 // Run starts everything and blocks until ctx is done or a signal arrives.
@@ -175,6 +376,14 @@ func (a *App) Run(ctx context.Context) error {
 		Addr:              a.Cfg.Listen,
 		Handler:           a.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// 内嵌代理核心：先于监听器启动（executor/隧道依赖其出口）
+	if a.Cfg.Proxy.Enabled && a.coreLink != nil {
+		if err := a.startProxyCore(); err != nil {
+			return fmt.Errorf("proxy core: %w", err)
+		}
+		defer a.coreMgr.Stop()
 	}
 
 	errCh := make(chan error, 2)
@@ -199,12 +408,16 @@ func (a *App) Run(ctx context.Context) error {
 
 		maxBytes, _ := hunits.ParseBytes(a.Cfg.Tunnel.MaxBytesPerConn)
 		idle, _ := hunits.ParseDuration(a.Cfg.Tunnel.IdleTimeout)
+		if uerr := upstreamproxy.Validate(a.Cfg.Tunnel.UpstreamProxy); uerr != nil {
+			return fmt.Errorf("tunnel upstream_proxy: %w", uerr)
+		}
 		a.tunnelSrv = tunnel.New(tunnel.Config{
 			Tokens:           a.Tokens,
 			Nonces:           auth.NewNonceStore(10 * time.Minute),
 			WL:               a.WLStore,
 			Policy:           &ssrf.Policy{BlockPrivate: true, Ports: []int{80, 443}},
 			Audit:            a.Audit,
+			UpstreamProxy:    a.Cfg.Tunnel.UpstreamProxy,
 			MaxConnsPerToken: a.Cfg.Tunnel.MaxConnsPerToken,
 			MaxBytesPerConn:  maxBytes,
 			IdleTimeout:      idle,

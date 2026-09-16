@@ -2,12 +2,16 @@ package executor
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +117,84 @@ func TestBuiltinTimeout(t *testing.T) {
 	b := NewBuiltin(BuiltinConfig{Timeout: 50 * time.Millisecond, Retries: 0, Policy: loopbackPolicy(srv.URL)})
 	if _, err := b.Fetch(context.Background(), srv.URL+"/slow", t.TempDir(), "slow"); err == nil {
 		t.Fatal("expected timeout error")
+	}
+}
+
+func TestBuiltinViaUpstreamProxy(t *testing.T) {
+	// 源站（回环）：经代理 CONNECT 透传抓取
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"px"`)
+		fmt.Fprint(w, "proxied-artifact")
+	}))
+	defer origin.Close()
+
+	// 本地 HTTP 代理：CONNECT 透传 + 绝对形式转发（模拟 Xray mixed 入站）
+	proxyFwd := &http.Transport{Proxy: nil}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			// absolute-form 转发（http URL 经代理的标准行为）
+			req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			req.Header = r.Header.Clone()
+			resp, err := proxyFwd.RoundTrip(req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			return
+		}
+		hj := w.(http.Hijacker)
+		client, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		target, err := net.DialTimeout("tcp", r.Host, 3*time.Second)
+		if err != nil {
+			client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			return
+		}
+		defer target.Close()
+		client.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+		done := make(chan struct{}, 2)
+		go func() { io.Copy(target, client); done <- struct{}{} }()
+		go func() { io.Copy(client, target); done <- struct{}{} }()
+		<-done
+	}))
+	defer proxy.Close()
+
+	// 端口白名单放行源站端口：上游代理模式下策略仅做本地端口检查，
+	// 目标 DNS/SSRF 由代理负责（回环源站因此可达）
+	ou, _ := url.Parse(origin.URL)
+	oport, _ := strconv.Atoi(ou.Port())
+	b := NewBuiltin(BuiltinConfig{
+		UpstreamProxy: proxy.URL,
+		Policy:        &ssrf.Policy{Ports: []int{oport}},
+	})
+	res, err := b.Fetch(context.Background(), origin.URL+"/ok/file.zip", t.TempDir(), "file.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ETag != "px" || res.Size != int64(len("proxied-artifact")) {
+		t.Fatalf("res = %+v", res)
+	}
+
+	// 端口白名单在上游代理模式下仍生效（本地拒绝，未出网）
+	denied := NewBuiltin(BuiltinConfig{UpstreamProxy: proxy.URL}) // 默认端口 [80,443]
+	_, err = denied.Fetch(context.Background(), "http://127.0.0.1:1/file", t.TempDir(), "x")
+	if err == nil || !strings.Contains(err.Error(), "E_PORT_DENIED") {
+		t.Fatalf("port policy must still apply when proxied, got %v", err)
 	}
 }
 

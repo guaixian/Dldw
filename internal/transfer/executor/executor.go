@@ -12,8 +12,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,13 +49,19 @@ type BuiltinConfig struct {
 	Timeout       time.Duration
 	UserAgent     string
 	MaxRedirects  int
-	FollowRedirect bool
+	// UpstreamProxy is an optional http(s):// proxy for ALL origin fetches
+	// (e.g. Xray mixed inbound http://127.0.0.1:10808). When set, target
+	// DNS/SSRF resolution is delegated to the proxy; the port allowlist
+	// above still applies locally.
+	UpstreamProxy string
 }
 
 // Builtin is the default zero-dependency executor.
 type Builtin struct {
-	cfg    BuiltinConfig
-	client *http.Client
+	cfg       BuiltinConfig
+	client    *http.Client
+	policy    *ssrf.Policy
+	proxyURL  string
 }
 
 func NewBuiltin(cfg BuiltinConfig) *Builtin {
@@ -74,17 +82,28 @@ func NewBuiltin(cfg BuiltinConfig) *Builtin {
 		policy = &ssrf.Policy{BlockPrivate: true}
 	}
 	tr := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           policy.DialContext,
 		MaxIdleConns:          8,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DisableCompression:    true, // artifacts are already compressed; avoid gzip traps
 	}
-	return &Builtin{cfg: cfg, client: &http.Client{
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	if cfg.UpstreamProxy != "" {
+		// 经上游代理：拨号目标是代理本身（普通 dialer），目标主机的
+		// DNS/SSRF 判定由代理执行；本地仍保留端口白名单（见 fetchOnce）。
+		pu, err := url.Parse(cfg.UpstreamProxy)
+		if err == nil && (pu.Scheme == "http" || pu.Scheme == "https") {
+			tr.Proxy = http.ProxyURL(pu)
+			tr.DialContext = (&net.Dialer{Timeout: 15 * time.Second}).DialContext
+		}
+	} else {
+		// 直连：SSRF 策略拨号（拨号时校验 IP，防 DNS rebinding）
+		tr.Proxy = nil
+		tr.DialContext = policy.DialContext
+	}
+	return &Builtin{
+		cfg:    cfg,
+		client: &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= cfg.MaxRedirects {
 				return fmt.Errorf("stopped after %d redirects", len(via))
 			}
@@ -92,8 +111,10 @@ func NewBuiltin(cfg BuiltinConfig) *Builtin {
 				return fmt.Errorf("refused redirect to %s", req.URL.Scheme)
 			}
 			return nil
-		},
-	}}
+		}},
+		policy:   policy,
+		proxyURL: cfg.UpstreamProxy,
+	}
 }
 
 func (b *Builtin) Name() string { return "builtin" }
@@ -145,6 +166,21 @@ func (b *Builtin) fetchOnce(ctx context.Context, rawURL, destDir, hintName strin
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
+	}
+	// 上游代理模式下目标 DNS/SSRF 由代理负责，但端口白名单仍在本地强制
+	if b.proxyURL != "" && b.policy != nil {
+		port := 80
+		if req.URL.Scheme == "https" {
+			port = 443
+		}
+		if p := req.URL.Port(); p != "" {
+			if n, aerr := strconv.Atoi(p); aerr == nil {
+				port = n
+			}
+		}
+		if perr := b.policy.CheckPort(port); perr != nil {
+			return nil, perr
+		}
 	}
 	req.Header.Set("User-Agent", b.cfg.UserAgent)
 	req.Header.Set("Accept", "*/*")

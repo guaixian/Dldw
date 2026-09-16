@@ -24,6 +24,7 @@ import (
 	"dldw/internal/server/audit"
 	"dldw/internal/server/auth"
 	"dldw/internal/server/ratelimit"
+	"dldw/internal/upstreamproxy"
 )
 
 // Config wires tunnel dependencies and limits.
@@ -33,6 +34,12 @@ type Config struct {
 	WL     *whitelist.Store
 	Policy *ssrf.Policy
 	Audit  *audit.Logger
+
+	// UpstreamProxy is an optional http(s):// proxy for tunnel egress
+	// (e.g. Xray mixed inbound http://127.0.0.1:10808). When set, target
+	// DNS/SSRF resolution is delegated to the proxy; whitelist and port
+	// policy still apply locally, and the OK reply reports resolved_ip "-".
+	UpstreamProxy string
 
 	HandshakeTimeout time.Duration // default 10s
 	IdleTimeout      time.Duration // default 5m
@@ -164,14 +171,18 @@ func (s *Server) handle(conn net.Conn) {
 		cfg.Audit.Log("tunnel_port_deny", "", "token_id", rec.ID, "host", req.Host, "port", req.Port)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.HandshakeTimeout)
-	if herr := cfg.Policy.CheckHost(ctx, req.Host); herr != nil {
+	if cfg.UpstreamProxy == "" {
+		// 直连模式：连接前完成 DNS 解析 + 私网/保留段阻断
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.HandshakeTimeout)
+		if herr := cfg.Policy.CheckHost(ctx, req.Host); herr != nil {
+			cancel()
+			s.reject(conn, ssrf.ErrorCode(herr), herr.Error())
+			cfg.Audit.Log("tunnel_ssrf_deny", "", "token_id", rec.ID, "host", req.Host)
+			return
+		}
 		cancel()
-		s.reject(conn, ssrf.ErrorCode(herr), herr.Error())
-		cfg.Audit.Log("tunnel_ssrf_deny", "", "token_id", rec.ID, "host", req.Host)
-		return
 	}
-	cancel()
+	// 上游代理模式：DNS/SSRF 委托给代理；白名单与端口策略已在本地强制
 
 	// concurrency
 	release, ok := s.concs(rec.ID)
@@ -182,22 +193,35 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	defer release()
 
-	// dial with guarded dialer (validates IPs again at dial time)
+	// dial: 经上游代理（CONNECT）或带 SSRF 守卫的直连
 	dctx, dcancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer dcancel()
-	target, derr := cfg.Policy.DialContext(dctx, "tcp", net.JoinHostPort(req.Host, strconv.Itoa(req.Port)))
-	if derr != nil {
+	var target net.Conn
+	resolved := "-"
+	if cfg.UpstreamProxy != "" {
+		target, err = upstreamproxy.Dial(dctx, cfg.UpstreamProxy, net.JoinHostPort(req.Host, strconv.Itoa(req.Port)))
+		if err == nil {
+			if ta, ok := target.RemoteAddr().(*net.TCPAddr); ok && !ta.IP.IsLoopback() {
+				resolved = ta.IP.String() // 代理地址，仅作参考
+			}
+		}
+	} else {
+		target, err = cfg.Policy.DialContext(dctx, "tcp", net.JoinHostPort(req.Host, strconv.Itoa(req.Port)))
+		if err == nil {
+			if ta, ok := target.RemoteAddr().(*net.TCPAddr); ok {
+				resolved = ta.IP.String()
+			}
+		}
+	}
+	if err != nil {
 		s.reject(conn, "E_UPSTREAM", "connect failed")
-		cfg.Audit.Log("tunnel_dial_fail", "", "token_id", rec.ID, "host", req.Host, "port", req.Port, "error", derr.Error())
+		cfg.Audit.Log("tunnel_dial_fail", "", "token_id", rec.ID, "host", req.Host, "port", req.Port,
+			"proxied", cfg.UpstreamProxy != "", "error", err.Error())
 		return
 	}
 	defer target.Close()
 
 	connID := ids.NewConnID()
-	resolved := "-"
-	if ta, ok := target.RemoteAddr().(*net.TCPAddr); ok {
-		resolved = ta.IP.String()
-	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, werr := conn.Write((&dldw1.OK{
 		ConnID:     connID,
@@ -211,7 +235,7 @@ func (s *Server) handle(conn net.Conn) {
 	start := time.Now()
 	var total int64
 	cfg.Audit.Log("tunnel_open", connID, "token_id", rec.ID, "client_id", req.ClientID,
-		"host", req.Host, "port", req.Port, "resolved_ip", resolved)
+		"host", req.Host, "port", req.Port, "resolved_ip", resolved, "proxied", cfg.UpstreamProxy != "")
 
 	done := make(chan struct{}, 2)
 	go func() { s.pump(conn, target, connID, &total, false); done <- struct{}{} }()

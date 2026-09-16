@@ -85,6 +85,17 @@ func Run(opts Options) int {
 	// child env
 	env := adapters.BuildEnv(os.Environ(), proxyURL)
 
+	// 镜像自动注入：uv/pip/npm 系工具且用户未自行配置 index/registry 时，
+	// 指向服务端拉穿镜像（探测失败静默跳过）
+	if opts.Server != "" {
+		if extra := injectMirrors(opts, info.Name, opts.Args, env); len(extra) > 0 {
+			env = append(env, extra...)
+			for _, kv := range extra {
+				fmt.Fprintf(stderr, "dldw: mirror %s\n", kv)
+			}
+		}
+	}
+
 	cmd := exec.Command(bin, opts.Args...)
 	cmd.Stdin = orReader(opts.Stdin)
 	cmd.Stdout = stdout
@@ -137,6 +148,25 @@ func Run(opts Options) int {
 		return 1
 	}
 	return 0
+}
+
+// injectMirrors 探测服务端镜像能力并生成注入的环境变量（失败静默）。
+func injectMirrors(opts Options, tool string, args, env []string) []string {
+	client, err := downloader.NewAPIClient(opts.Server, "", "")
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	caps, err := client.Capabilities(ctx)
+	if err != nil || caps == nil {
+		return nil
+	}
+	return adapters.InjectMirrors(tool, args, env, opts.Server, adapters.MirrorCaps{
+		PyPI:   caps.PyPI,
+		NPM:    caps.NPM,
+		GoMod:  caps.GoMod,
+	})
 }
 
 func orWriter(w io.Writer) io.Writer {

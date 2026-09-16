@@ -117,16 +117,16 @@ func encodeSegment(s string) string {
 	return b.String()
 }
 
-// canonicalURI returns the canonical resource path for key.
-func (d *Driver) canonicalURI(key string) string {
+// canonicalURI returns the canonical resource path for key (fails on bad keys).
+func (d *Driver) canonicalURI(key string) (string, error) {
 	if err := storage.ValidateKey(key); err != nil {
-		return ""
+		return "", err
 	}
 	enc := encodePath(key)
 	if d.cfg.PathStyle {
-		return "/" + d.cfg.Bucket + "/" + enc
+		return "/" + d.cfg.Bucket + "/" + enc, nil
 	}
-	return "/" + enc
+	return "/" + enc, nil
 }
 
 func hmacSHA256(key []byte, data string) []byte {
@@ -144,6 +144,9 @@ func amzDate(t time.Time) string { return t.UTC().Format("20060102T150405Z") }
 
 // Presign produces a presigned URL for method/key valid for expires.
 func (d *Driver) Presign(method, key string, expires time.Duration) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", err
+	}
 	if expires <= 0 {
 		expires = 15 * time.Minute
 	}
@@ -163,9 +166,13 @@ func (d *Driver) Presign(method, key string, expires time.Duration) (string, err
 
 	host := d.objectHost()
 	canonQuery := canonicalQueryString(q)
+	canonicalURI, err := d.canonicalURI(key)
+	if err != nil {
+		return "", err
+	}
 	canonicalRequest := strings.Join([]string{
 		method,
-		d.canonicalURI(key),
+		canonicalURI,
 		canonQuery,
 		"host:" + host + "\n",
 		"host",
@@ -303,7 +310,8 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 }
 
 func (d *Driver) Ping(ctx context.Context) error {
-	_, err := d.Head(ctx, ".probe/healthz")
+	// key 不能以 . 开头（ValidateKey 约束），否则签名路径错误
+	_, err := d.Head(ctx, "probe/healthz")
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil // reachable: bucket listing responded 404
 	}

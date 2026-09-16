@@ -101,6 +101,12 @@ func (e *Engine) Store() *Store { return e.store }
 
 // objectKey maps a cache key to a storage object path.
 func objectKey(family, cacheKey string) string {
+	return StorageKeyFor(family, cacheKey)
+}
+
+// StorageKeyFor 计算 cache key 的存储对象路径（client/server/pypi 镜像共用，
+// 保证不同入口写入/读取同一对象）。
+func StorageKeyFor(family, cacheKey string) string {
 	if len(cacheKey) < 4 {
 		return fmt.Sprintf("cache/%s/%s.bin", family, cacheKey)
 	}
