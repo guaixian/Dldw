@@ -1,0 +1,105 @@
+# ============================================================================
+# dldw 服务端配置（带注释模板）
+#
+# 用法：  dldw serve --config /etc/dldw/server.yaml
+# 格式：  YAML 子集（缩进嵌套 / 标量 / [a, b] 内联列表 / # 注释），
+#         也支持 JSON（同名字段，见 internal/server/app/config.go 的 json tag）。
+# 加载：  Default(配置文件目录) 打底 -> 本文件覆盖 -> 空缺路径基于 data_dir 补全。
+# 热更：  whitelist_file 修改后约 30s 内自动重载；其余字段需重启进程。
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 网络：控制 API（/healthz /readyz /api/v1/... /files/）
+# ----------------------------------------------------------------------------
+listen: 127.0.0.1:8080        # 监听地址；对外服务改 0.0.0.0:8080 并配 TLS/反代
+public_base: http://127.0.0.1:8080
+# 对外可见的基础 URL。localfs 驱动的预签名下载 URL 会拼在它后面
+# （<public_base>/files/<key>?exp=..&sig=..）。生产环境填
+# https://dldw.example.com 这样的真实域名，客户端才能访问到。
+
+tls:                          # 控制 API 的 TLS（可选；也可用 nginx/caddy 终结）
+  cert: ""                    # PEM 证书路径，如 /etc/dldw/tls/fullchain.pem
+  key: ""                     # PEM 私钥路径；两者都为空 = 明文监听
+
+# ----------------------------------------------------------------------------
+# DLDW/1 受控出口隧道（spec 4.2）
+#
+# !! 端口约定：客户端按 server URL 推导隧道地址——URL 显式端口 P -> P+1；
+# !! https 默认 4443，http 默认 8081。修改本端口需同步调整客户端用法。
+# ----------------------------------------------------------------------------
+tunnel:
+  enabled: true
+  listen: 127.0.0.1:8081      # 对外服务改 0.0.0.0:8081
+  tls:                        # 生产环境必须启用（令牌/数据否则明文传输）
+    cert: ""                  # 如 /etc/dldw/tls/tunnel-fullchain.pem
+    key: ""                   # 如 /etc/dldw/tls/tunnel-privkey.pem
+  max_conns_per_token: 16     # 每个设备 token 的并发隧道连接上限
+  max_bytes_per_conn: 256MiB  # 单连接字节上限；隧道不承载大文件（大文件走 dldw get）
+  idle_timeout: 300s          # 空闲超时；同时作为握手 OK 应答里的 expires_in
+
+# ----------------------------------------------------------------------------
+# 对象存储（缓存工件存放处，spec 4.3）
+#
+# driver=localfs：本地磁盘 + HMAC 预签名 URL，由本进程 /files/ 提供 Range 下载。
+#                 自托管/开发简单，但缓存命中流量仍走 API 端口。
+# driver=s3    ：S3/MinIO/OSS SigV4 预签名直传，客户端直连对象存储，
+#                 缓存命中时 dldw 服务器零字节中转（生产推荐）。
+# ----------------------------------------------------------------------------
+storage:
+  driver: localfs
+
+  # --- localfs 专用 ---
+  root: /var/lib/dldw/objects       # 对象根目录；相对路径基于 data_dir
+  secret: change-me-to-random-32-bytes
+                                    # 预签名 HMAC 密钥（>=16 字节）。
+                                    # !! 生产必须换成随机值；泄露 = 任何人可下任意缓存对象
+
+  # --- s3 专用（driver 切换为 s3 时生效）---
+  s3:
+    endpoint: https://s3.us-east-1.amazonaws.com
+    region: us-east-1
+    bucket: dldw-cache               # 建议专用桶，生命周期规则可配 TTL
+    access_key: "AKIA..."            # AccessKey ID
+    secret_key: "..."                # !! 仅写在服务端配置，不下发给客户端
+    path_style: false                # MinIO/自建 = true；AWS 虚拟主机风格 = false
+
+# ----------------------------------------------------------------------------
+# 源站抓取执行器：缓存未命中时由谁去下载原始 URL
+# ----------------------------------------------------------------------------
+executor:
+  driver: builtin                   # builtin（默认，纯 Go，带重试）| aria2
+  max_bytes: 8GiB                   # 单工件大小上限；超出直接拒绝（0 = 不限）
+  ports: [80, 443]                  # 允许访问源站的端口白名单（SSRF 收敛）
+  allow_loopback: false             # !! 仅本地测试（源站在 127.0.0.1）时置 true；
+                                    # !! 公网部署必须 false，否则可被抓取内网资源
+
+  aria2:                            # driver=aria2 时生效
+    rpc_url: http://127.0.0.1:6800/jsonrpc
+    secret: ""                      # aria2 的 rpc-secret，不带 "token:" 前缀
+
+# ----------------------------------------------------------------------------
+# 设备令牌（spec 5：设备 token 与控制面密钥分离）
+# ----------------------------------------------------------------------------
+auth:
+  tokens_file: /var/lib/dldw/tokens.json   # 令牌库（只存哈希，可跨重启）
+  token_ttl: 720h                          # 令牌有效期；客户端可 refresh 轮换
+  allow_registration: true                 # POST /api/v1/token 注册开关。
+                                           # 完成设备接入后建议改 false 防滥用
+
+# ----------------------------------------------------------------------------
+# 数据与运维
+# ----------------------------------------------------------------------------
+whitelist_file: /etc/dldw/whitelist.txt
+# 隧道域名白名单（模板见 deploy/whitelist.example.txt）：
+#   每行一个域名；"github.com" 同时匹配任意子域；# 开头为注释；
+#   可用 "# version: 2026-09-16.1" 头部声明版本，doctor 会比对。
+#   修改文件后约 30s 自动热加载，无需重启。
+
+tasks_file: /var/lib/dldw/tasks.json   # 任务状态持久化（重启可恢复进行中的任务）
+tmp_dir: /var/lib/dldw/tmp             # 任务临时下载目录；GC 定时清理孤儿文件
+audit_log: ""                          # 审计日志（JSON lines）；空 = 打到 stdout
+data_dir: /var/lib/dldw                # 未配置/相对路径的解析基准目录
+presign_ttl: 15m                       # 预签名 URL 有效期；临期客户端自动 refresh
+
+# block_private: true                  # 可选：执行器出口是否阻断私网目标。
+                                       # 默认（缺省）即 true；loopback/link-local 无论如何都阻断

@@ -1,0 +1,25 @@
+version: "3.8"
+
+# dldw server (control API + tunnel + localfs cache).
+# For production prefer the s3 storage driver and put TLS in front.
+services:
+  dldw:
+    build:
+      context: ..
+      dockerfile: ../Dockerfile
+      args:
+        VERSION: "1.0.0"
+    image: dldw:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080" # control API (put your TLS reverse proxy here)
+      - "127.0.0.1:8081:8081" # DLDW/1 tunnel (enable TLS in production)
+    volumes:
+      - dldw-data:/data
+    environment:
+      TZ: UTC
+    # 将 deploy/server.example.yaml 拷贝为挂载卷里的 /data/server.yaml 并按需修改
+    command: ["serve", "--config", "/data/server.yaml"]
+
+volumes:
+  dldw-data:

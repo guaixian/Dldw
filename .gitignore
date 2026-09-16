@@ -1,0 +1,22 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Go build artifacts
+dist/
+*.exe
+*.test
+*.out
+dldw
+dldw-*
+
+# Runtime data (local dev servers / smoke tests)
+data/
+*.log
+*.part
+*.part.meta.json
+
+# OS
+Thumbs.db
+.DS_Store

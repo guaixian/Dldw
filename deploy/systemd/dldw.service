@@ -1,0 +1,28 @@
+[Unit]
+Description=dldw server (download accelerator control plane)
+Documentation=https://dldw.example.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dldw
+Group=dldw
+ExecStart=/usr/local/bin/dldw serve --config /etc/dldw/server.json
+Environment=DLDW_HOME=/var/lib/dldw
+Restart=on-failure
+RestartSec=2s
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dldw
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
