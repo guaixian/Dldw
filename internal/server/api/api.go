@@ -59,7 +59,14 @@ type Config struct {
 	// Go module proxy 镜像（nil = 不挂载 /gomod/*）
 	GoMod http.Handler
 	// Docker Registry V2 镜像（nil = 不挂载 /v2/*）
+	// 注意：docker daemon 不会向 registry-mirror 发送凭证，/v2 不参与 MirrorAuth。
 	Registry http.Handler
+	// HuggingFace Hub 代理（nil = 不挂载 /hf/*）
+	HF http.Handler
+	// MirrorAuth 为 true 时，/pypi /npm /mirror /gomod /hf 需要设备令牌
+	// （Authorization: Bearer <token> 或 Basic（用户名或密码为 token））。
+	// 客户端 wrapper 自动把令牌嵌入注入的镜像 URL（userinfo 形式）。
+	MirrorAuth bool
 }
 
 // New builds the HTTP handler with all routes (spec 4.1):
@@ -114,6 +121,13 @@ func New(cfg Config) http.Handler {
 		mux.HandleFunc("GET /files/{key...}", cfg.handleFile)
 		mux.HandleFunc("HEAD /files/{key...}", cfg.handleFile)
 	}
+	// 镜像端点鉴权包装（MirrorAuth 开启时）
+	authWrap := func(h http.Handler) http.Handler {
+		if !cfg.MirrorAuth || h == nil {
+			return h
+		}
+		return cfg.mirrorAuth(h)
+	}
 	if cfg.PyPI != nil {
 		// GET /pypi/simple/<pkg>/   索引代理（HTML/JSON 双格式，链接重写）
 		// GET /pypi/packages/<path> wheel -> 302 预签名（首次抓取入库）
@@ -122,7 +136,7 @@ func New(cfg Config) http.Handler {
 		}
 		mux.HandleFunc("GET /pypi/simple/{pkg}", simple)
 		mux.HandleFunc("GET /pypi/simple/{pkg}/", simple)
-		mux.HandleFunc("GET /pypi/packages/{path...}", cfg.PyPI.ServePackage)
+		mux.Handle("GET /pypi/packages/{path...}", authWrap(http.HandlerFunc(cfg.PyPI.ServePackage)))
 	}
 	if cfg.NPM != nil {
 		// GET /npm/<pkg>            元数据代理（tarball 链接重写 + 内存缓存）
@@ -131,17 +145,21 @@ func New(cfg Config) http.Handler {
 			cfg.NPM.ServeMetadata(w, r, cfg.NPMClient)
 		}
 		mux.HandleFunc("GET /npm/{pkg}", meta)
-		mux.HandleFunc("GET /npm/tarball/{path...}", cfg.NPM.ServeTarball)
+		mux.Handle("GET /npm/tarball/{path...}", authWrap(http.HandlerFunc(cfg.NPM.ServeTarball)))
 	}
 	if cfg.WebMirror != nil {
 		// GET /mirror/{scheme}/{host}/{path...}  apt(.deb)/yum(.rpm)/任意静态文件
-		mux.Handle("GET /mirror/{scheme}/{host}/{path...}", cfg.WebMirror)
-		mux.Handle("HEAD /mirror/{scheme}/{host}/{path...}", cfg.WebMirror)
+		mux.Handle("GET /mirror/{scheme}/{host}/{path...}", authWrap(cfg.WebMirror))
+		mux.Handle("HEAD /mirror/{scheme}/{host}/{path...}", authWrap(cfg.WebMirror))
 	}
 	if cfg.GoMod != nil {
 		// GET /gomod/{path...}  Go module proxy（版本化文件缓存，其余透传）
-		mux.Handle("GET /gomod/{path...}", cfg.GoMod)
-		mux.Handle("HEAD /gomod/{path...}", cfg.GoMod)
+		mux.Handle("GET /gomod/{path...}", authWrap(cfg.GoMod))
+		mux.Handle("HEAD /gomod/{path...}", authWrap(cfg.GoMod))
+	}
+	if cfg.HF != nil {
+		// GET /hf/{path...}  HuggingFace Hub 代理（SHA 版本文件缓存，API 透传）
+		mux.Handle("/hf/{path...}", authWrap(cfg.HF))
 	}
 	if cfg.Registry != nil {
 		// GET/HEAD /v2/...  Docker Registry V2 拉穿镜像（manifest 缓存 + blob 入库）
@@ -151,12 +169,14 @@ func New(cfg Config) http.Handler {
 	// 能力探测（无鉴权）：客户端 wrapper 据此决定是否自动注入镜像地址
 	mux.HandleFunc("GET /api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"request_id": requestID(r),
-			"pypi":       cfg.PyPI != nil,
-			"npm":        cfg.NPM != nil,
-			"mirror":     cfg.WebMirror != nil,
-			"gomod":      cfg.GoMod != nil,
-			"registry":   cfg.Registry != nil,
+			"request_id":  requestID(r),
+			"pypi":        cfg.PyPI != nil,
+			"npm":         cfg.NPM != nil,
+			"mirror":      cfg.WebMirror != nil,
+			"gomod":       cfg.GoMod != nil,
+			"hf":          cfg.HF != nil,
+			"registry":    cfg.Registry != nil,
+			"mirror_auth": cfg.MirrorAuth,
 		})
 	})
 
@@ -255,6 +275,43 @@ func (c *Config) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), ctxTokenRec, rec)))
 	}
+}
+
+// mirrorAuth 是镜像端点的令牌鉴权中间件：接受
+//   - Authorization: Bearer <token>
+//   - Authorization: Basic（用户名或密码任一为 token）
+// 兼容 pip/uv/go 把令牌写在镜像 URL userinfo 的常见用法。
+func (c *Config) mirrorAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, tok := range mirrorTokenCandidates(r) {
+			if tok != "" {
+				if _, err := c.Tokens.Validate(tok); err == nil {
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxRequestID, requestID(r))))
+					return
+				}
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="dldw-mirror"`)
+		writeErr(w, requestID(r), http.StatusUnauthorized, "E_MIRROR_AUTH",
+			"device token required (Bearer, or Basic with token as username/password)")
+	})
+}
+
+// mirrorTokenCandidates 从 Bearer 或 Basic 头提取候选令牌（用户名与密码都试）。
+func mirrorTokenCandidates(r *http.Request) []string {
+	var out []string
+	if t := auth.BearerToken(r.Header.Get("Authorization")); t != "" {
+		return []string{t}
+	}
+	if user, pass, ok := r.BasicAuth(); ok {
+		if user != "" {
+			out = append(out, user)
+		}
+		if pass != "" {
+			out = append(out, pass)
+		}
+	}
+	return out
 }
 
 // --- helpers --------------------------------------------------------------

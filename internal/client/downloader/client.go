@@ -297,10 +297,13 @@ func (c *Client) Raw(ctx context.Context, method, path string, body any, out any
 
 // CapabilitiesResponse mirrors GET /api/v1/capabilities（wrapper 据此自动注入镜像）。
 type CapabilitiesResponse struct {
-	PyPI   bool `json:"pypi"`
-	NPM    bool `json:"npm"`
-	Mirror bool `json:"mirror"`
-	GoMod  bool `json:"gomod"`
+	PyPI       bool `json:"pypi"`
+	NPM        bool `json:"npm"`
+	Mirror     bool `json:"mirror"`
+	GoMod      bool `json:"gomod"`
+	HF         bool `json:"hf"`
+	Registry   bool `json:"registry"`
+	MirrorAuth bool `json:"mirror_auth"`
 }
 
 // Capabilities 探测服务端开启了哪些拉穿镜像。

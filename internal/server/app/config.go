@@ -108,6 +108,16 @@ type AuthConfig struct {
 	TokensFile        string `json:"tokens_file"`        // 令牌存储文件（只存哈希）
 	TokenTTL          string `json:"token_ttl"`          // 令牌有效期，如 "720h"；支持 refresh 轮换
 	AllowRegistration bool   `json:"allow_registration"` // 是否开放 POST /api/v1/token 注册；完成设备接入后建议关闭
+	// MirrorAuth 为 true 时，/pypi /npm /mirror /gomod /hf 需要设备令牌
+	//（Bearer 或 Basic），用于把镜像端点暴露到局域网/公网给团队共享；
+	// /v2（Docker）不参与——daemon 不会向 mirror 发凭证，需网络层限制。
+	MirrorAuth bool `json:"mirror_auth"`
+}
+
+// HFConfig 配置 HuggingFace Hub 代理。
+type HFConfig struct {
+	Enabled bool   `json:"enabled"` // 是否挂载 /hf/* 路由
+	Origin  string `json:"origin"`  // 默认 https://huggingface.co
 }
 
 // ProxyCoreConfig 内嵌代理核心（sing-box 子进程托管），让服务端自带出口，
@@ -185,6 +195,7 @@ type Config struct {
 	NPM           NPMConfig      `json:"npm"`           // npm 拉穿镜像
 	Mirror        WebMirrorConfig `json:"mirror"`       // 通用静态文件拉穿镜像（apt/yum）
 	GoMod         GoModConfig    `json:"gomod"`         // Go module proxy 镜像
+	HF            HFConfig       `json:"huggingface"`   // HuggingFace Hub 代理
 	Registry      DockerRegistryConfig `json:"registry"` // Docker Registry V2 镜像
 	WhitelistFile string         `json:"whitelist_file"` // 隧道白名单文件（热加载，改文件即生效）
 	TasksFile     string         `json:"tasks_file"`    // 任务持久化文件（JSON，重启可恢复）

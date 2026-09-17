@@ -22,6 +22,7 @@ import (
 	"dldw/internal/server/audit"
 	"dldw/internal/server/auth"
 	"dldw/internal/server/gomod"
+	"dldw/internal/server/hfmirror"
 	"dldw/internal/server/npm"
 	"dldw/internal/server/proxycore"
 	"dldw/internal/server/pypi"
@@ -55,6 +56,7 @@ type App struct {
 	WebMirror *webmirror.Mirror
 	GoModM *gomod.Mirror
 	Registry *registrymirror.Mirror
+	HFM *hfmirror.Mirror
 
 	coreLink *proxycore.ShareLink // 解析后的分享链接（proxy.enabled 时非空）
 	coreMgr  *proxycore.Manager
@@ -293,6 +295,12 @@ func New(cfg Config) (*App, error) {
 		}, passClient, a.Storage, a.Engine.Store())
 	}
 
+	// HuggingFace Hub 代理（huggingface.enabled 时挂载 /hf/*）
+	if cfg.HF.Enabled {
+		a.HFM = hfmirror.New(hfmirror.Config{Origin: cfg.HF.Origin}, passClient,
+			a.Storage, a.Exec, a.Engine.Store(), cfg.TmpDir, cfg.PresignTTLDuration())
+	}
+
 	return a, nil
 }
 
@@ -327,6 +335,8 @@ func (a *App) Handler() http.Handler {
 		WebMirror:         handlerOrNil(a.WebMirror),
 		GoMod:             handlerOrNil(a.GoModM),
 		Registry:          handlerOrNil(a.Registry),
+		HF:                handlerOrNil(a.HFM),
+		MirrorAuth:        a.Cfg.Auth.MirrorAuth,
 	})
 }
 

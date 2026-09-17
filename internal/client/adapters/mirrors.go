@@ -1,6 +1,7 @@
 package adapters
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,71 +9,86 @@ import (
 
 // MirrorCaps 是服务端镜像能力（来自 /api/v1/capabilities）。
 type MirrorCaps struct {
-	PyPI   bool
-	NPM    bool
-	Mirror bool
-	GoMod  bool
+	PyPI       bool
+	NPM        bool
+	Mirror     bool
+	GoMod      bool
+	HF         bool
+	// MirrorAuth 为 true 时服务端镜像端点要求令牌，注入的 URL 需嵌入凭证。
+	MirrorAuth bool
 }
 
 // InjectMirrors 在用户未自行配置 index/registry 时，为 uv/pip/npm 系工具
-// 返回自动注入的镜像环境变量。
+// 返回自动注入的镜像环境变量。token 为设备令牌（服务端开启镜像鉴权时
+// 以 userinfo 形式嵌入 URL，pip/uv/go/npm 均支持）。
 //
 // 优先级（高 -> 低）：用户命令行 flag > 用户环境变量 > 用户项目/用户级配置文件
 // > dldw 自动注入。只要检测到用户自己的配置，一律不注入。
-func InjectMirrors(tool string, args []string, env []string, serverBase string, caps MirrorCaps) []string {
+func InjectMirrors(tool string, args []string, env []string, serverBase, token string, caps MirrorCaps) []string {
 	if serverBase == "" {
 		return nil
 	}
 	serverBase = strings.TrimRight(serverBase, "/")
-	pypiEnv := [2]string{"UV_INDEX_URL", serverBase + "/pypi/simple"}
-	npmVal := serverBase + "/npm"
+	// mirrorBase 形如 http://<token>@127.0.0.1:18080（鉴权开启时）
+	mirrorBase := serverBase
+	if caps.MirrorAuth && token != "" {
+		if u, err := url.Parse(serverBase); err == nil && u.User == nil {
+			u.User = url.User(token)
+			mirrorBase = u.String()
+		}
+	}
+	pypiURL := mirrorBase + "/pypi/simple"
+	npmURL := mirrorBase + "/npm"
 
+	var out []string
+	var toolEnv []string
 	switch tool {
 	case "uv":
-		if !caps.PyPI || userSpecifiesIndex(args, env, uvIndexFlags, uvIndexEnv, uvProjectConfig) {
-			return nil
+		if caps.PyPI && !userSpecifiesIndex(args, env, uvIndexFlags, uvIndexEnv, uvProjectConfig) {
+			toolEnv = []string{"UV_INDEX_URL=" + pypiURL}
 		}
-		return []string{pypiEnv[0] + "=" + pypiEnv[1]}
 	case "pip", "pip3":
-		if !caps.PyPI || !isReadSubcommand(args, pipReadSubcommands) {
-			return nil
+		if caps.PyPI && isReadSubcommand(args, pipReadSubcommands) &&
+			!userSpecifiesIndex(args, env, pipIndexFlags, pipIndexEnv, pipConfigFiles) {
+			toolEnv = []string{"PIP_INDEX_URL=" + pypiURL}
 		}
-		if userSpecifiesIndex(args, env, pipIndexFlags, pipIndexEnv, pipConfigFiles) {
-			return nil
-		}
-		return []string{"PIP_INDEX_URL=" + pypiEnv[1]}
 	case "python", "python3":
 		// python -m pip ...：定位 pip 子命令参数
 		if len(args) >= 2 && args[0] == "-m" && (args[1] == "pip" || args[1] == "pip3") {
-			return InjectMirrors(args[1], args[2:], env, serverBase, caps)
+			return InjectMirrors(args[1], args[2:], env, serverBase, token, caps)
 		}
-		return nil
 	case "go":
 		// Go modules：GOPROXY 协议镜像；用户已设 GOPROXY（env 或 go env -w）时尊重
-		if !caps.GoMod {
-			return nil
+		if caps.GoMod && !goProxyConfigured(env) {
+			toolEnv = []string{"GOPROXY=" + mirrorBase + "/gomod,direct"}
 		}
-		if goProxyConfigured(env) {
-			return nil
-		}
-		return []string{"GOPROXY=" + serverBase + "/gomod,direct"}
 	case "npm", "pnpm", "yarn", "bun":
-		if !caps.NPM {
-			return nil
-		}
-		if !isReadSubcommand(args, npmReadSubcommands) {
-			return nil
-		}
-		if userSpecifiesIndex(args, env, npmIndexFlags, npmIndexEnv, npmConfigFiles) {
-			return nil
-		}
-		// 大小写各一份（npm/pnpm 在不同平台读取的 env 大小写不同）
-		return []string{
-			"NPM_CONFIG_REGISTRY=" + npmVal,
-			"npm_config_registry=" + npmVal,
+		if caps.NPM && isReadSubcommand(args, npmReadSubcommands) &&
+			!userSpecifiesIndex(args, env, npmIndexFlags, npmIndexEnv, npmConfigFiles) {
+			// 大小写各一份（npm/pnpm 在不同平台读取的 env 大小写不同）
+			toolEnv = []string{
+				"NPM_CONFIG_REGISTRY=" + npmURL,
+				"npm_config_registry=" + npmURL,
+			}
 		}
 	}
-	return nil
+	out = append(out, toolEnv...)
+	// HF_ENDPOINT：任何被包装工具都可能跑 python/hf 工具链，统一追加注入
+	//（用户已设置时尊重用户）
+	if caps.HF && !envHas(env, "HF_ENDPOINT") && os.Getenv("HF_ENDPOINT") == "" {
+		out = append(out, "HF_ENDPOINT="+mirrorBase+"/hf")
+	}
+	return out
+}
+
+func envHas(env []string, key string) bool {
+	for _, kv := range env {
+		eq := strings.IndexByte(kv, '=')
+		if eq > 0 && strings.EqualFold(kv[:eq], key) && strings.TrimSpace(kv[eq+1:]) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 var (

@@ -168,10 +168,12 @@ func injectMirrors(opts Options, tool string, args, env []string) []string {
 	if err != nil || caps == nil {
 		return nil
 	}
-	return adapters.InjectMirrors(tool, args, env, opts.Server, adapters.MirrorCaps{
-		PyPI:   caps.PyPI,
-		NPM:    caps.NPM,
-		GoMod:  caps.GoMod,
+	return adapters.InjectMirrors(tool, args, env, opts.Server, opts.Token, adapters.MirrorCaps{
+		PyPI:       caps.PyPI,
+		NPM:        caps.NPM,
+		GoMod:      caps.GoMod,
+		HF:         caps.HF,
+		MirrorAuth: caps.MirrorAuth,
 	})
 }
 
