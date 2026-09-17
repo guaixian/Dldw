@@ -1,25 +1,55 @@
+# ============================================================================
+# dldw 服务端 Docker Compose 编排
+#
+# 单容器包含：dldw（API + 隧道 + 全部镜像）+ sing-box（代理核心）+ localfs 存储
+# 不需要外部数据库 / 对象存储 / Java / Python
+#
+# 用法：
+#   cd deploy/compose
+#   docker compose up -d
+#
+# 首次配置：
+#   1. 把 ../../deploy/server.example.yaml 拷贝到 ./data/server.yaml 并编辑
+#   2. 填入 proxy.share_link（hysteria2://...）
+#   3. 按需开启 mirror_auth / TLS
+# ============================================================================
+
 version: "3.8"
 
-# dldw server (control API + tunnel + localfs cache).
-# For production prefer the s3 storage driver and put TLS in front.
 services:
   dldw:
     build:
-      context: ..
-      dockerfile: ../Dockerfile
+      context: ../..
+      dockerfile: Dockerfile
       args:
-        VERSION: "1.0.0"
+        VERSION: "1.6.0"
     image: dldw:latest
+    container_name: dldw-server
     restart: unless-stopped
+
     ports:
-      - "127.0.0.1:8080:8080" # control API (put your TLS reverse proxy here)
-      - "127.0.0.1:8081:8081" # DLDW/1 tunnel (enable TLS in production)
+      - "8080:8080"   # 控制 API（含 /pypi /npm /mirror /gomod /hf /v2 镜像端点）
+      - "8081:8081"   # DLDW/1 隧道（生产环境建议加 TLS）
+
     volumes:
-      - dldw-data:/data
+      - dldw-data:/data   # server.yaml + localfs 存储 + 令牌/任务/审计
+
     environment:
       TZ: UTC
-    # 将 deploy/server.example.yaml 拷贝为挂载卷里的 /data/server.yaml 并按需修改
-    command: ["serve", "--config", "/data/server.yaml"]
+
+    healthcheck:
+      test: ["CMD", "dldw", "doctor", "--server", "http://127.0.0.1:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 资源限制（按需调整）
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
 
 volumes:
   dldw-data:

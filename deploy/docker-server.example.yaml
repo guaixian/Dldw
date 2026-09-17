@@ -1,0 +1,73 @@
+# ============================================================================
+# dldw Docker 部署配置（容器内运行，localfs 存储 + 内嵌 sing-box）
+#
+# 容器内路径约定：
+#   /data/server.yaml    本文件（挂载为配置）
+#   /data/objects        localfs 对象存储
+#   /data/tokens.json    设备令牌
+#   /data/tasks.json     任务持久化
+#   /data/audit.jsonl    审计日志
+#   /data/proxycore/     sing-box 配置与日志（由 dldw 自动生成）
+#
+# 与裸机部署的区别：
+#   - listen 必须绑 0.0.0.0（容器内网络）
+#   - public_base 填宿主机可达的地址
+#   - 存储：默认 localfs（容器卷），不需要外部 S3
+# ============================================================================
+
+listen: 0.0.0.0:8080
+public_base: http://127.0.0.1:8080   # 改为宿主机可达地址，如 http://<宿主IP>:8080
+
+tunnel:
+  enabled: true
+  listen: 0.0.0.0:8081
+  mode: whitelist_only          # 或 relay_all（dldc 全局中转）
+  # TLS 生产环境建议启用
+  # tls: {cert: /data/tls/tun.pem, key: /data/tls/tun.key}
+  max_conns_per_token: 16
+  max_bytes_per_conn: 256MiB
+  idle_timeout: 300s
+
+# 内嵌代理核心：容器内自带 sing-box，填分享链接即可
+proxy:
+  enabled: true
+  core: sing-box
+  binary: /usr/local/bin/sing-box   # 容器内路径，已内嵌
+  share_link: "hysteria2://password@hy.example.com:32319?sni=hy.example.com&obfs=salamander&obfs-password=xxx#node"
+  listen: 127.0.0.1
+  port: 1080
+  log_level: warn
+
+storage:
+  driver: localfs
+  root: /data/objects
+  secret: change-me-to-random-32-bytes   # 生产必须换
+
+executor:
+  driver: builtin
+  max_bytes: 8GiB
+  ports: [80, 443]
+  allow_loopback: false
+
+auth:
+  allow_registration: true    # 完成设备接入后改 false
+  mirror_auth: false          # 暴露到公网时改 true
+
+pypi:
+  enabled: true
+npm:
+  enabled: true
+mirror:
+  enabled: true
+gomod:
+  enabled: true
+huggingface:
+  enabled: true
+registry:
+  enabled: true
+  username: ""                # Docker Hub 账号（绕开匿名限流）
+  password: ""
+
+data_dir: /data
+presign_ttl: 15m
+audit_log: /data/audit.jsonl
