@@ -3,6 +3,9 @@
 .vscode/
 *.iml
 
+# npm test artifacts
+.npmrc
+
 # Go build artifacts
 dist/
 *.exe
