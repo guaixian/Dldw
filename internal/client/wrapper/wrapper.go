@@ -40,6 +40,7 @@ type Options struct {
 }
 
 // Run executes the wrapped tool and returns its exit code.
+// ForceTunnel（dldc/relay 模式）时所有流量走服务端隧道，必须配置 server+token。
 func Run(opts Options) int {
 	stdout := orWriter(opts.Stdout)
 	stderr := orWriter(opts.Stderr)
@@ -47,6 +48,11 @@ func Run(opts Options) int {
 		if opts.Verbose > 0 {
 			fmt.Fprintf(stderr, "dldw: "+format+"\n", args...)
 		}
+	}
+
+	if opts.ForceTunnel && (opts.Server == "" || opts.Token == "") {
+		fmt.Fprintln(stderr, "dldw: relay mode (dldc) requires server and token (dldw doctor --fix)")
+		return 4
 	}
 
 	bin, err := exec.LookPath(opts.Tool)
@@ -225,6 +231,7 @@ func startProxy(opts Options, debugf func(string, ...any)) (*proxy.Server, error
 		WL:          wl,
 		Policy:      policy,
 		Tunnel:      tunnelCfg,
+		ForceTunnel: opts.ForceTunnel, // dldc/relay：所有域名强制走隧道
 		IdleTimeout: opts.Cfg.ProxyIdleTimeout(),
 		Metrics:     m,
 		Debugf:      debugf,

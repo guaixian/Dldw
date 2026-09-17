@@ -27,13 +27,14 @@ const familyGoMod = "go-module"
 
 // Config 配置 gomod 镜像。
 type Config struct {
-	Origin    string        // 上游 GOPROXY，默认 https://proxy.golang.org
+	Origin      string   `json:"-"` // 兼容单源写法
+	Origins     []string // 上游 GOPROXY 列表（顺序回退），如 [proxy.golang.org, goproxy.cn]
 	PassTimeout time.Duration
 }
 
 // Mirror 是 Go module proxy 镜像。
 type Mirror struct {
-	origin  string
+	origins []string
 	fetch   *mirrorcore.Fetcher
 	group   *mirrorcore.Group
 	client  *http.Client
@@ -42,19 +43,27 @@ type Mirror struct {
 
 // New 构造。client 用于动态路径透传（nil = 默认直连）。
 func New(cfg Config, client *http.Client, stor storage.Storage, exec executor.Executor, store *tasks.Store, tmpDir string, presignTTL time.Duration) *Mirror {
-	if cfg.Origin == "" {
-		cfg.Origin = "https://proxy.golang.org"
+	origins := cfg.Origins
+	if origins == nil {
+		origins = []string{}
+		for _, s := range []string{cfg.Origin, "https://proxy.golang.org"} {
+			if s != "" {
+				origins = append(origins, s)
+			}
+		}
 	}
-	cfg.Origin = strings.TrimRight(cfg.Origin, "/")
+	for i := range origins {
+		origins[i] = strings.TrimRight(origins[i], "/")
+	}
 	if cfg.PassTimeout <= 0 {
 		cfg.PassTimeout = time.Minute
 	}
 	return &Mirror{
-		origin:  cfg.Origin,
-		fetch:   &mirrorcore.Fetcher{Stor: stor, Exec: exec, Store: store, TmpDir: tmpDir, PresignTTL: presignTTL},
-		group:   mirrorcore.NewGroup(),
-		client:  client,
-		timeout: cfg.PassTimeout,
+		origins:  origins,
+		fetch:    &mirrorcore.Fetcher{Stor: stor, Exec: exec, Store: store, TmpDir: tmpDir, PresignTTL: presignTTL},
+		group:    mirrorcore.NewGroup(),
+		client:   client,
+		timeout:  cfg.PassTimeout,
 	}
 }
 
@@ -75,9 +84,13 @@ func (m *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 版本化的不可变文件 -> 缓存；其余（list/latest/sumdb）透传
 	if isImmutable(p) {
-		canonical := m.origin + "/" + p
+		canonical := m.origins[0] + "/" + p
+		candidates := make([]string, 0, len(m.origins))
+		for _, o := range m.origins {
+			candidates = append(candidates, o+"/"+p)
+		}
 		v, _ := m.group.Do(familyGoMod+"\n"+canonical, func() (any, error) {
-			return m.fetch.PresignOrFetch(r.Context(), canonical, familyGoMod, "gomod-mirror")
+			return m.fetch.PresignOrFetchMulti(r.Context(), canonical, candidates, familyGoMod, "gomod-mirror")
 		})
 		target, _ := v.(string)
 		if target == "" {
@@ -88,7 +101,7 @@ func (m *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusFound)
 		return
 	}
-	m.servePassthrough(w, r, m.origin+"/"+p)
+	m.servePassthrough(w, r, m.origins[0]+"/"+p)
 }
 
 // isImmutable 判断 <module>/@v/<version>.{zip,mod,info}（不可变文件）。

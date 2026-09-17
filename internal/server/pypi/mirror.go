@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -34,24 +35,30 @@ import (
 
 // Config 配置镜像行为（源站可替换，便于测试与私有 devpi）。
 type Config struct {
-	IndexOrigin string // 默认 https://pypi.org
-	FilesOrigin string // 默认 https://files.pythonhosted.org
-	PublicBase  string // 对外基础 URL，如 http://127.0.0.1:18080
-	IndexTTL    time.Duration
-	TmpDir      string // 抓取临时目录
-	PresignTTL  time.Duration
+	IndexOrigin  string   `json:"-"` // 兼容单源写法（等价于 IndexOrigins[0]）
+	IndexOrigins []string // 索引源列表（顺序回退）：如 [pypi.org, tuna, aliyun]
+	FilesOrigin  string   `json:"-"` // 兼容单源写法
+	FilesOrigins []string // wheel 源列表（顺序回退）
+	PublicBase   string   // 对外基础 URL，如 http://127.0.0.1:18080
+	IndexTTL     time.Duration
+	TmpDir       string // 抓取临时目录
+	PresignTTL   time.Duration
 	FetchTimeout time.Duration
 }
 
 func (c Config) withDefaults() Config {
-	if c.IndexOrigin == "" {
-		c.IndexOrigin = "https://pypi.org"
+	if c.IndexOrigins == nil {
+		c.IndexOrigins = nonEmpty([]string{c.IndexOrigin, "https://pypi.org"})
 	}
-	if c.FilesOrigin == "" {
-		c.FilesOrigin = "https://files.pythonhosted.org"
+	if c.FilesOrigins == nil {
+		c.FilesOrigins = nonEmpty([]string{c.FilesOrigin, "https://files.pythonhosted.org"})
 	}
-	c.IndexOrigin = strings.TrimRight(c.IndexOrigin, "/")
-	c.FilesOrigin = strings.TrimRight(c.FilesOrigin, "/")
+	for i := range c.IndexOrigins {
+		c.IndexOrigins[i] = strings.TrimRight(c.IndexOrigins[i], "/")
+	}
+	for i := range c.FilesOrigins {
+		c.FilesOrigins[i] = strings.TrimRight(c.FilesOrigins[i], "/")
+	}
 	if c.IndexTTL <= 0 {
 		c.IndexTTL = 10 * time.Minute
 	}
@@ -62,6 +69,16 @@ func (c Config) withDefaults() Config {
 		c.FetchTimeout = 10 * time.Minute
 	}
 	return c
+}
+
+func nonEmpty(ss []string) []string {
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // Mirror 是 PyPI 拉穿镜像。
@@ -111,36 +128,52 @@ func (m *Mirror) ServeSimple(w http.ResponseWriter, r *http.Request, upstream *h
 	if upstream == nil {
 		upstream = &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
-		m.cfg.IndexOrigin+"/simple/"+pkg+"/", nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// 多源顺序回退：主源失败（网络错误/5xx）时尝试下一个
+	var body []byte
+	var ctype string
+	for _, origin := range m.cfg.IndexOrigins {
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+			origin+"/simple/"+pkg+"/", nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// 同时接受 HTML 与 PEP 691 JSON 两种 simple 索引格式
+		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01")
+		resp, err := upstream.Do(req)
+		if err != nil {
+			continue
+		}
+		b, rerr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+				continue // 源站故障/限流 -> 下一源
+			}
+			// 4xx 视为确定结果（如 404），透传并停止尝试
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			w.Write(b)
+			return
+		}
+		body, ctype = b, resp.Header.Get("Content-Type")
+		break
 	}
-	// 同时接受 HTML 与 PEP 691 JSON 两种 simple 索引格式
-	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01")
-	resp, err := upstream.Do(req)
-	if err != nil {
-		http.Error(w, "index origin unreachable: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		http.Error(w, "read index: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+	if body == nil {
+		http.Error(w, "all index origins unreachable", http.StatusBadGateway)
 		return
 	}
 
-	// 重写文件链接 -> 本镜像（HTML href 与 JSON url 均为绝对地址，统一替换）
-	rewritten := strings.ReplaceAll(string(body),
-		m.cfg.FilesOrigin+"/packages/", m.cfg.PublicBase+"/pypi/packages/")
-	ctype := resp.Header.Get("Content-Type")
+	// 重写文件链接 -> 本镜像（HTML href 与 JSON url 均为绝对地址，统一替换；
+	// 任一 FilesOrigin 的前缀都重写，来源不限）
+	rewritten := string(body)
+	for _, fo := range m.cfg.FilesOrigins {
+		rewritten = strings.ReplaceAll(rewritten,
+			fo+"/packages/", m.cfg.PublicBase+"/pypi/packages/")
+	}
 	if ctype == "" {
 		ctype = "text/html; charset=utf-8"
 	}
@@ -190,18 +223,32 @@ func (m *Mirror) ServePackage(w http.ResponseWriter, r *http.Request) {
 
 // serveWheel 返回预签名 URL；未命中则抓取入库（singleflight 去重并发）。
 // 家族固定为 pypi-file：真实 files.pythonhosted.org URL 的分类结果一致，
-// 因此与 `dldw get` 共享同一 cache key。
+// 因此与 `dldw get` 共享同一 cache key（键取 FilesOrigins[0]，源站回退不影响键）。
 func (m *Mirror) serveWheel(ctx context.Context, canonicalURL string) (string, error) {
 	canonical, err := urlcanon.Canonicalize(canonicalURL)
 	if err != nil {
 		return "", err
 	}
+	candidates := []string{}
+	for _, fo := range m.cfg.FilesOrigins {
+		if u, uerr := urlcanon.Canonicalize(fo + pathAfterPackages(canonical)); uerr == nil {
+			candidates = append(candidates, u)
+		}
+	}
 	v, _ := m.group.Do(canonical, func() (any, error) {
-		return m.fetch.PresignOrFetch(ctx, canonical, urlcanon.FamilyPyPIFile, "pypi-mirror")
+		return m.fetch.PresignOrFetchMulti(ctx, canonical, candidates, urlcanon.FamilyPyPIFile, "pypi-mirror")
 	})
 	url, _ := v.(string)
 	if url == "" {
 		return "", fmt.Errorf("cache error")
 	}
 	return url, nil
+}
+
+// pathAfterPackages 提取 /packages/ 之后的路径。
+func pathAfterPackages(canonical string) string {
+	if i := strings.Index(canonical, "/packages/"); i >= 0 {
+		return canonical[i:]
+	}
+	return "/packages/" + path.Base(canonical)
 }

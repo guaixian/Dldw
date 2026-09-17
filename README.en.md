@@ -100,12 +100,29 @@ Precedence: `CLI flags > tool adapters > config file > defaults`.
 | `dldw <tool> [args...]` | wrap a tool: local proxy + env injection + adapters + mirror auto-injection |
 | `dldw get <url> [out]` | resolve → presigned ranged download, resume, sha256 verify |
 | `dldw repo <git-url> [dir]` | repo snapshot via codeload tarball (cached) with safe extraction |
+| `dldw relay <tool> [args...]` | relay mode: force all traffic through the server tunnel (same as dldc) |
 | `dldw env` | shell exports for a persistent proxy (`dldw proxy`) |
 | `dldw doctor [--fix]` | diagnostics: bind, DNS, clock skew, health, token, whitelist, storage, tools |
 | `dldw benchmark` | direct / tunnel / presigned TTFB and throughput comparison |
 | `dldw config` | init / show / set / unset / path |
 | `dldw proxy` | long-running local proxy with periodic whitelist refresh |
 | `dldw serve [--no-proxy-core]` | run the server (flag disables the embedded proxy core) |
+
+### dldc: the relay client
+
+`dldc` is **the same binary** as `dldw` (copy `dldw.exe` to `dldc.exe`, or use `dldw relay`),
+switching to a "relay everything through the server tunnel" mode — covering the cases that
+cannot be cached (full `git clone`, arbitrary non-whitelisted sites):
+
+```bash
+dldc git clone https://github.com/org/repo.git    # full git protocol via the VPS
+dldc curl https://any-site.example/api            # any public host
+dldc pip install xxx                              # mirrors hit the cache first, relay for the rest
+```
+
+Requires `tunnel.mode: relay_all` on the server (non-whitelisted hosts allowed;
+SSRF/port/token/limit policies **all still apply**). The trade-off:
+**dldw = precise whitelist tunneling with cache priority; dldc = global relaying**.
 
 Global flags (before the subcommand): `--server --token --profile --no-proxy --apply --direct-fallback/--no-direct-fallback --force-tunnel -v/-vv`.
 
@@ -145,6 +162,7 @@ per request and Docker auth tokens are dynamic, but git objects (tarballs) and D
 - **Mirror auto-injection (v1.2)**: when wrapping uv/pip/npm/pnpm/yarn/go the wrapper probes `/api/v1/capabilities` and injects `UV_INDEX_URL` / `PIP_INDEX_URL` / `NPM_CONFIG_REGISTRY` / `GOPROXY` unless the user configured their own — precedence: CLI flags > env vars > project/user config files > auto-injection. User config always wins.
 - **Generic static mirror and Go modules (v1.3)**: `/mirror/{scheme}/{host}/{path}` covers apt (.deb), yum/dnf (.rpm) and any static file (repo metadata is detected and passed through so indexes never go stale; by-hash paths cached). `/gomod/*` implements the GOPROXY protocol (immutable versioned .zip/.mod/.info cached; list/latest/sumdb passed through).
 - **Docker Registry mirror and `dldw repo` (v1.4)**: `/v2/*` pull-through — blobs stored with a forced SHA256 digest check, tag manifests short-TTL / digest manifests cached forever, Docker Hub credentials held server-side. `dldw repo <url>` turns a repo snapshot into a codeload tarball through the cache and extracts it safely (path traversal fails closed).
+- **dldc relay mode and multi-origin failover (v1.5)**: `tunnel.mode: relay_all` plus `dldc` / `dldw relay` (the same binary detects its program name) — pure relaying for any public host, covering the non-cacheable cases (full `git clone` etc.); SSRF/port/token/limit policies are unchanged. The pypi/npm/gomod mirrors accept `*_origins` lists with sequential failover (à la verdaccio uplinks): when the primary origin fails or rate-limits, the next origin is used (e.g. pypi.org → TUNA → Aliyun), while the cache key stays pinned to the primary origin.
 
 ## Error codes
 

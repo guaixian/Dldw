@@ -100,12 +100,27 @@ eval "$(dldw env)"               # PowerShell: dldw env --shell powershell | Inv
 | `dldw <工具> [参数...]` | 包装工具：本地代理 + 环境注入 + 适配器 + 镜像地址自动注入 |
 | `dldw get <URL> [输出]` | 解析 → 预签名分块下载、断点续传、sha256 校验 |
 | `dldw repo <git地址> [目录]` | 仓库快照：转 codeload tarball 缓存下载并安全解包 |
+| `dldw relay <工具> [参数...]` | 中转模式：全部流量强制走服务端隧道（等价 dldc） |
 | `dldw env` | 输出常驻代理（`dldw proxy`）配套的环境变量 |
 | `dldw doctor [--fix]` | 体检：端口、DNS、时钟、健康检查、令牌、白名单、存储、工具 |
 | `dldw benchmark` | 直连 / 隧道 / 预签名 三模式的首字节与吞吐对比 |
 | `dldw config` | init / show / set / unset / path |
 | `dldw proxy` | 常驻本地代理（周期性刷新白名单） |
 | `dldw serve [--no-proxy-core]` | 运行服务端（参数可临时禁用内嵌代理核心） |
+
+### dldc：纯中转客户端
+
+`dldc` 与 `dldw` 是**同一程序**（`dldw.exe` 复制为 `dldc.exe` 即可，或等价使用 `dldw relay`），
+进入"全部流量经服务端隧道"的模式——补齐做不了缓存的场景（完整 git clone、任意非白名单站点）：
+
+```bash
+dldc git clone https://github.com/org/repo.git    # 完整 git 协议经 VPS 中转
+dldc curl https://任意站点/api                     # 任意公网域名
+dldc pip install xxx                              # 镜像优先命中缓存，未命中走中转
+```
+
+要求服务端 `tunnel.mode: relay_all`（放行非白名单域名；SSRF/端口/令牌/限额**全部照旧**）。
+两种模式的取舍：**dldw = 白名单精准隧道 + 缓存优先；dldc = 全局中转**。
 
 全局参数（放在子命令之前）：`--server --token --profile --no-proxy --apply --direct-fallback/--no-direct-fallback --force-tunnel -v/-vv`。
 
@@ -144,6 +159,7 @@ HTTP 层不可缓存不等于不可缓存：git 的 packfile 按协商生成、D
 - **镜像地址自动注入（v1.2）**：包装 uv/pip/npm/pnpm/yarn/go 时探测 `/api/v1/capabilities`，用户未自配源则注入 `UV_INDEX_URL` / `PIP_INDEX_URL` / `NPM_CONFIG_REGISTRY` / `GOPROXY`；优先级：命令行 flag > 环境变量 > 项目/用户配置文件 > 自动注入，用户配置永远优先。
 - **通用静态镜像与 Go modules（v1.3）**：`/mirror/{协议}/{域名}/{路径}` 覆盖 apt(.deb)/yum·dnf(.rpm)/任意静态文件（仓库元数据自动识别并透传，防止拿到过期索引；by-hash 路径缓存）；`/gomod/*` 实现 GOPROXY 协议（版本化 .zip/.mod/.info 永久缓存，list/latest/sumdb 透传）。
 - **Docker Registry 镜像与 `dldw repo`（v1.4）**：`/v2/*` 拉穿——blob 按 digest 入库并强制 SHA256 校验，tag manifest 短 TTL / digest manifest 永久缓存，服务端统一持有 Docker Hub 凭证；`dldw repo <地址>` 把仓库快照转为 codeload tarball 走缓存并安全解包（路径穿越整体拒绝）。
+- **dldc 中转模式与多上游回退（v1.5）**：`tunnel.mode: relay_all` + `dldc`/`dldw relay`（同一二进制按程序名识别）——任意公网域名的纯中转，覆盖不可缓存场景（完整 git clone 等）；SSRF/端口/令牌/限额不变。pypi/npm/gomod 镜像支持 `*_origins` 源站列表顺序回退（学 verdaccio uplinks）：主源故障/限流自动切备用源（如 pypi.org → 清华 → 阿里），缓存键稳定取主源。
 
 ## 错误码
 

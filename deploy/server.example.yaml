@@ -30,6 +30,10 @@ tls:                          # 控制 API 的 TLS（可选；也可用 nginx/ca
 tunnel:
   enabled: true
   listen: 127.0.0.1:8081      # 对外服务改 0.0.0.0:8081
+  # mode: whitelist_only      # 默认：仅白名单域名（dldw 语义）
+  mode: whitelist_only
+  # relay_all：任意公网域名中转（dldc/dldw relay 语义），SSRF/端口/令牌/限额不变
+  # mode: relay_all
   tls:                        # 生产环境必须启用（令牌/数据否则明文传输）
     cert: ""                  # 如 /etc/dldw/tls/tunnel-fullchain.pem
     key: ""                   # 如 /etc/dldw/tls/tunnel-privkey.pem

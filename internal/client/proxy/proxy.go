@@ -37,6 +37,11 @@ type Options struct {
 	// Tunnel is the server tunnel config; nil disables tunneling (all direct).
 	Tunnel *TunnelConfig
 
+	// ForceTunnel 为 true 时所有目标（无论是否在白名单）都走服务端隧道——
+	// dldc/relay 模式：不做缓存、纯中转，配合服务端 tunnel.mode=relay_all
+	// 可覆盖任意公网域名（SSRF/端口策略在两侧仍然生效）。
+	ForceTunnel bool
+
 	IdleTimeout    time.Duration // default 5m
 	MaxHeaderBytes int           // default 16KiB
 	CopyBuffer     int           // default 32KiB
@@ -264,12 +269,14 @@ func (s *Server) handleConnect(conn net.Conn, br *bufio.Reader, target string) {
 	s.pump(conn, upstream)
 }
 
-// connectUpstream dials host:port either via tunnel (whitelisted) or direct.
+// connectUpstream dials host:port either via tunnel (whitelisted or forced)
+// or direct.
 func (s *Server) connectUpstream(host string, port int) (net.Conn, string, error) {
 	if s.loopDetect(host, port) {
 		return nil, "", fmt.Errorf("E_PROXY_LOOP: refusing to proxy to self")
 	}
-	if s.opts.WL.Get().Match(host) && s.opts.Tunnel != nil {
+	tunnelWanted := s.opts.ForceTunnel || s.opts.WL.Get().Match(host)
+	if tunnelWanted && s.opts.Tunnel != nil {
 		tc, _, err := TunnelDial(context.Background(), *s.opts.Tunnel, host, port, map[string]string{"v": "1"})
 		if err != nil {
 			return nil, "tunnel", err

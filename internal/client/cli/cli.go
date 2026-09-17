@@ -5,6 +5,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"dldw/internal/client/config"
@@ -25,8 +26,19 @@ type globals struct {
 }
 
 // Main is the CLI entry point; it returns the process exit code.
+// 程序名以 dldc 开头时进入中转模式（所有流量强制走服务端隧道）：
+// dldw.exe 复制/链接为 dldc.exe 即获得 dldc 命令，无需单独构建。
 func Main(args []string) int {
+	name := filepath.Base(os.Args[0])
+	base := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
+	return mainWith(args, strings.HasPrefix(base, "dldc"))
+}
+
+func mainWith(args []string, relayMode bool) int {
 	g := globals{}
+	if relayMode {
+		g.forceTunnel = true
+	}
 	i := 0
 	for ; i < len(args); i++ {
 		a := args[i]
@@ -90,6 +102,24 @@ dispatch:
 
 	cmd, cmdArgs := rest[0], rest[1:]
 	switch cmd {
+	case "relay":
+		// dldw relay <tool> [args...] —— 等价于 dldc：<全部流量强制走服务端隧道>
+		if len(cmdArgs) == 0 {
+			fmt.Fprintln(os.Stderr, "usage: dldw relay <tool> [args...]   # 例: dldw relay git clone <url>")
+			return 2
+		}
+		g.forceTunnel = true
+		return wrapper.Run(wrapper.Options{
+			Tool:        cmdArgs[0],
+			Args:        cmdArgs[1:],
+			Cfg:         cfg,
+			Token:       resolveToken(cfg, g),
+			Server:      config.EffectiveServer(g.server, cfg),
+			NoProxy:     g.noProxy,
+			Apply:       g.apply,
+			ForceTunnel: true,
+			Verbose:     g.verbose,
+		})
 	case "get":
 		return cmdGet(cfg, g, cmdArgs)
 	case "repo":

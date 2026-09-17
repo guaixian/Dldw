@@ -41,6 +41,13 @@ type Config struct {
 	// policy still apply locally, and the OK reply reports resolved_ip "-".
 	UpstreamProxy string
 
+	// Mode selects the egress policy:
+	//   "whitelist_only"（默认）仅白名单域名放行（dldw 语义）
+	//   "relay_all"        全部放行（dldc 语义：任意公网域名中转）
+	// 两种模式都保留：token/nonce、端口白名单、SSRF（私网/保留段阻断）、
+	// 并发与字节上限、审计。
+	Mode string
+
 	HandshakeTimeout time.Duration // default 10s
 	IdleTimeout      time.Duration // default 5m
 	MaxConnsPerToken int           // default 16
@@ -161,8 +168,14 @@ func (s *Server) handle(conn net.Conn) {
 	}
 
 	// policy checks
-	if !cfg.WL.Get().Match(req.Host) {
-		s.reject(conn, "E_NOT_WHITELISTED", "host not in whitelist")
+	if cfg.Mode == "relay_all" {
+		// dldc 语义：任意域名放行；白名单命中与否仅记审计，不拦截。
+		// SSRF/端口/令牌/限额仍然全部生效（安全下限不变）。
+		if !cfg.WL.Get().Match(req.Host) {
+			cfg.Audit.Log("tunnel_relay_offwl", "", "token_id", rec.ID, "host", req.Host, "client_id", req.ClientID)
+		}
+	} else if !cfg.WL.Get().Match(req.Host) {
+		s.reject(conn, "E_NOT_WHITELISTED", "host not in whitelist (server tunnel.mode=whitelist_only)")
 		cfg.Audit.Log("tunnel_wl_deny", "", "token_id", rec.ID, "host", req.Host)
 		return
 	}

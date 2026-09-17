@@ -152,9 +152,10 @@ func TestTarballFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("first: %d", resp.StatusCode)
+		t.Fatalf("first: %d body=%s", resp.StatusCode, b)
 	}
 	if !strings.HasPrefix(resp.Header.Get("Location"), "http://mirror.local/files/") {
 		t.Fatalf("location: %q", resp.Header.Get("Location"))
@@ -177,9 +178,10 @@ func TestTarballFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	body2, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusFound {
-		t.Fatalf("second: %d", resp2.StatusCode)
+		t.Fatalf("second: %d body=%s", resp2.StatusCode, body2)
 	}
 	// 元数据计数 +1 是允许的（这里没请求元数据），tgz 不应重复抓取
 	time.Sleep(50 * time.Millisecond)

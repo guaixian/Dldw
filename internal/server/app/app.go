@@ -224,12 +224,14 @@ func New(cfg Config) (*App, error) {
 	if cfg.PyPI.Enabled {
 		ttl, _ := hunits.ParseDuration(cfg.PyPI.IndexTTL)
 		a.PyPI = pypi.New(pypi.Config{
-			IndexOrigin: cfg.PyPI.IndexOrigin,
-			FilesOrigin: cfg.PyPI.FilesOrigin,
-			PublicBase:  cfg.PublicBase,
-			IndexTTL:    ttl,
-			TmpDir:      cfg.TmpDir,
-			PresignTTL:  cfg.PresignTTLDuration(),
+			IndexOrigin:  cfg.PyPI.IndexOrigin,
+			IndexOrigins: cfg.PyPI.IndexOrigins,
+			FilesOrigin:  cfg.PyPI.FilesOrigin,
+			FilesOrigins: cfg.PyPI.FilesOrigins,
+			PublicBase:   cfg.PublicBase,
+			IndexTTL:     ttl,
+			TmpDir:       cfg.TmpDir,
+			PresignTTL:   cfg.PresignTTLDuration(),
 		}, a.Storage, a.Exec, a.Engine.Store())
 	}
 
@@ -237,11 +239,12 @@ func New(cfg Config) (*App, error) {
 	if cfg.NPM.Enabled {
 		ttl, _ := hunits.ParseDuration(cfg.NPM.IndexTTL)
 		a.NPM = npm.New(npm.Config{
-			RegistryOrigin: cfg.NPM.RegistryOrigin,
-			PublicBase:     cfg.PublicBase,
-			IndexTTL:       ttl,
-			TmpDir:         cfg.TmpDir,
-			PresignTTL:     cfg.PresignTTLDuration(),
+			RegistryOrigin:  cfg.NPM.RegistryOrigin,
+			RegistryOrigins: cfg.NPM.RegistryOrigins,
+			PublicBase:      cfg.PublicBase,
+			IndexTTL:        ttl,
+			TmpDir:          cfg.TmpDir,
+			PresignTTL:      cfg.PresignTTLDuration(),
 		}, a.Storage, a.Exec, a.Engine.Store())
 	}
 
@@ -272,7 +275,7 @@ func New(cfg Config) (*App, error) {
 
 	// Go module proxy 镜像（gomod.enabled 时挂载 /gomod/*）
 	if cfg.GoMod.Enabled {
-		a.GoModM = gomod.New(gomod.Config{Origin: cfg.GoMod.Origin}, passClient,
+		a.GoModM = gomod.New(gomod.Config{Origin: cfg.GoMod.Origin, Origins: cfg.GoMod.Origins}, passClient,
 			a.Storage, a.Exec, a.Engine.Store(), cfg.TmpDir, cfg.PresignTTLDuration())
 	}
 
@@ -418,6 +421,7 @@ func (a *App) Run(ctx context.Context) error {
 			Policy:           &ssrf.Policy{BlockPrivate: true, Ports: []int{80, 443}},
 			Audit:            a.Audit,
 			UpstreamProxy:    a.Cfg.Tunnel.UpstreamProxy,
+			Mode:             a.Cfg.Tunnel.Mode,
 			MaxConnsPerToken: a.Cfg.Tunnel.MaxConnsPerToken,
 			MaxBytesPerConn:  maxBytes,
 			IdleTimeout:      idle,

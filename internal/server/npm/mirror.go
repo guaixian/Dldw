@@ -32,18 +32,27 @@ import (
 
 // Config 配置镜像行为。
 type Config struct {
-	RegistryOrigin string // 默认 https://registry.npmjs.org
-	PublicBase     string // 对外基础 URL
-	IndexTTL       time.Duration
-	TmpDir         string
-	PresignTTL     time.Duration
+	RegistryOrigin  string   `json:"-"` // 兼容单源写法（等价于 RegistryOrigins[0]）
+	RegistryOrigins []string // registry 源列表（顺序回退）
+	PublicBase      string   // 对外基础 URL
+	IndexTTL        time.Duration
+	TmpDir          string
+	PresignTTL      time.Duration
 }
 
 func (c Config) withDefaults() Config {
-	if c.RegistryOrigin == "" {
-		c.RegistryOrigin = "https://registry.npmjs.org"
+	if c.RegistryOrigins == nil {
+		origins := []string{}
+		for _, s := range []string{c.RegistryOrigin, "https://registry.npmjs.org"} {
+			if s != "" {
+				origins = append(origins, s)
+			}
+		}
+		c.RegistryOrigins = origins
 	}
-	c.RegistryOrigin = strings.TrimRight(c.RegistryOrigin, "/")
+	for i := range c.RegistryOrigins {
+		c.RegistryOrigins[i] = strings.TrimRight(c.RegistryOrigins[i], "/")
+	}
 	if c.IndexTTL <= 0 {
 		c.IndexTTL = 2 * time.Minute
 	}
@@ -117,36 +126,50 @@ func (m *Mirror) ServeMetadata(w http.ResponseWriter, r *http.Request, upstream 
 	if upstream == nil {
 		upstream = &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	}
-	// 元数据请求路径保留原始编码形式（npm 对 scope 包用 %2F）
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
-		m.cfg.RegistryOrigin+"/"+pkg, nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// 多源顺序回退
+	var body []byte
+	var ctype string
+	for _, origin := range m.cfg.RegistryOrigins {
+		// 元数据请求路径保留原始编码形式（npm 对 scope 包用 %2F）
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+			origin+"/"+pkg, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Accept", r.Header.Get("Accept")) // 透传 corgi 精简格式协商
+		resp, err := upstream.Do(req)
+		if err != nil {
+			continue
+		}
+		b, rerr := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+				continue
+			}
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			w.Write(b)
+			return
+		}
+		body, ctype = b, resp.Header.Get("Content-Type")
+		break
 	}
-	req.Header.Set("Accept", r.Header.Get("Accept")) // 透传 corgi 精简格式协商
-	resp, err := upstream.Do(req)
-	if err != nil {
-		http.Error(w, "registry unreachable: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		http.Error(w, "read metadata: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+	if body == nil {
+		http.Error(w, "all registry origins unreachable", http.StatusBadGateway)
 		return
 	}
 
-	// 重写 tarball 链接：origin/<pkg>/-/ -> PublicBase/npm/tarball/<pkg>/-/
-	rewritten := strings.ReplaceAll(string(body),
-		m.cfg.RegistryOrigin+"/"+pkg+"/-/", m.cfg.PublicBase+"/npm/tarball/"+pkg+"/-/")
-	ctype := resp.Header.Get("Content-Type")
+	// 重写 tarball 链接：任一源的 origin/<pkg>/-/ 前缀都替换为本地镜像
+	rewritten := string(body)
+	for _, origin := range m.cfg.RegistryOrigins {
+		rewritten = strings.ReplaceAll(rewritten,
+			origin+"/"+pkg+"/-/", m.cfg.PublicBase+"/npm/tarball/"+pkg+"/-/")
+	}
 	if ctype == "" {
 		ctype = "application/json"
 	}
@@ -179,7 +202,7 @@ func (m *Mirror) ServeTarball(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad path", http.StatusBadRequest)
 		return
 	}
-	canonical := m.cfg.RegistryOrigin + "/" + p
+	canonical := m.cfg.RegistryOrigins[0] + "/" + p
 
 	target, err := m.serveTarball(r.Context(), canonical)
 	if err != nil {
@@ -195,18 +218,45 @@ func (m *Mirror) ServeTarball(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveTarball 返回预签名 URL；未命中则抓取入库。家族固定 npm-tarball，
-// 与真实 registry.npmjs.org URL 的分类一致，因此与 dldw get 共享 cache key。
+// 缓存键取 RegistryOrigins[0]（源站回退不影响键），与 dldw get 共享。
 func (m *Mirror) serveTarball(ctx context.Context, canonicalURL string) (string, error) {
 	canonical, err := urlcanon.Canonicalize(canonicalURL)
 	if err != nil {
 		return "", err
 	}
+	candidates := []string{}
+	if i := strings.Index(canonicalURL, "/-/"); i >= 0 {
+		pkgPath := tarballPathOf(canonicalURL)     // <pkg>/-/<file>
+		suffix := canonicalURL[i:]                 // "/-/<file>"
+		for _, origin := range m.cfg.RegistryOrigins {
+			cand := origin + "/" + pkgPath
+			if u, uerr := urlcanon.Canonicalize(cand); uerr == nil {
+				candidates = append(candidates, u)
+			}
+			_ = suffix
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = []string{canonical}
+	}
 	v, _ := m.group.Do(canonical, func() (any, error) {
-		return m.fetch.PresignOrFetch(ctx, canonical, urlcanon.FamilyNpmTarball, "npm-mirror")
+		return m.fetch.PresignOrFetchMulti(ctx, canonical, candidates, urlcanon.FamilyNpmTarball, "npm-mirror")
 	})
 	url, _ := v.(string)
 	if url == "" {
 		return "", fmt.Errorf("cache error")
 	}
 	return url, nil
+}
+
+// tarballPathOf 提取 tarball URL 的 <pkg>/-/ 部分（去掉源站前缀）。
+func tarballPathOf(canonicalURL string) string {
+	s := canonicalURL
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if j := strings.IndexByte(s, '/'); j >= 0 {
+		s = s[j+1:] // <pkg>/-/<file>
+	}
+	return s
 }

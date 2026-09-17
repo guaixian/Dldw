@@ -39,6 +39,7 @@ type TunnelConfig struct {
 	Listen           string    `json:"listen"`              // 监听地址，如 0.0.0.0:8081
 	TLS              TLSConfig `json:"tls"`                 // 可选 TLS（生产环境必须启用）
 	UpstreamProxy    string    `json:"upstream_proxy"`      // 可选上游代理 http://127.0.0.1:10808（如 Xray mixed 入站）；启用后目标 DNS/SSRF 委托给代理，白名单与端口策略仍生效
+	Mode             string    `json:"mode"`                // whitelist_only（默认，dldw 语义）| relay_all（dldc 语义：任意公网域名中转，SSRF/端口/限额不变）
 	MaxConnsPerToken int       `json:"max_conns_per_token"` // 每 token 并发隧道连接上限
 	MaxBytesPerConn  string    `json:"max_bytes_per_conn"`  // 单连接字节上限（如 "256MiB"），隧道不承载大文件
 	IdleTimeout      string    `json:"idle_timeout"`        // 连接空闲超时（如 "300s"），同时作为 OK 应答的 expires_in
@@ -127,17 +128,20 @@ type ProxyCoreConfig struct {
 
 // PyPIConfig 配置 PyPI 拉穿镜像（uv/pip 吃服务端缓存）。
 type PyPIConfig struct {
-	Enabled     bool   `json:"enabled"`      // 是否挂载 /pypi/* 路由
-	IndexOrigin string `json:"index_origin"` // 默认 https://pypi.org（可指向私有 devpi）
-	FilesOrigin string `json:"files_origin"` // 默认 https://files.pythonhosted.org
-	IndexTTL    string `json:"index_ttl"`    // 索引页内存缓存 TTL，默认 10m
+	Enabled      bool     `json:"enabled"`       // 是否挂载 /pypi/* 路由
+	IndexOrigin  string   `json:"index_origin"`  // 兼容单源写法（等价 index_origins[0]）
+	IndexOrigins []string `json:"index_origins"` // 索引源列表（顺序回退），如 [https://pypi.org, https://pypi.tuna.tsinghua.edu.cn]
+	FilesOrigin  string   `json:"files_origin"`  // 兼容单源写法
+	FilesOrigins []string `json:"files_origins"` // wheel 源列表（顺序回退）
+	IndexTTL     string   `json:"index_ttl"`     // 索引页内存缓存 TTL，默认 10m
 }
 
 // NPMConfig 配置 npm registry 拉穿镜像（npm/pnpm/yarn 吃服务端缓存）。
 type NPMConfig struct {
-	Enabled        bool   `json:"enabled"`         // 是否挂载 /npm/* 路由
-	RegistryOrigin string `json:"registry_origin"` // 默认 https://registry.npmjs.org
-	IndexTTL       string `json:"index_ttl"`       // 元数据内存缓存 TTL，默认 2m
+	Enabled         bool     `json:"enabled"`          // 是否挂载 /npm/* 路由
+	RegistryOrigin  string   `json:"registry_origin"`  // 兼容单源写法
+	RegistryOrigins []string `json:"registry_origins"` // registry 源列表（顺序回退）
+	IndexTTL        string   `json:"index_ttl"`        // 元数据内存缓存 TTL，默认 2m
 }
 
 // WebMirrorConfig 配置通用静态文件拉穿镜像（apt .deb / yum .rpm / 任意静态
@@ -149,8 +153,9 @@ type WebMirrorConfig struct {
 
 // GoModConfig 配置 Go module proxy 拉穿镜像（GOPROXY 协议）。
 type GoModConfig struct {
-	Enabled bool   `json:"enabled"` // 是否挂载 /gomod/* 路由
-	Origin  string `json:"origin"`  // 上游 GOPROXY，默认 https://proxy.golang.org
+	Enabled bool     `json:"enabled"` // 是否挂载 /gomod/* 路由
+	Origin  string   `json:"origin"`  // 兼容单源写法（默认 https://proxy.golang.org）
+	Origins []string `json:"origins"` // 上游列表（顺序回退），如 [https://proxy.golang.org, https://goproxy.cn]
 }
 
 // DockerRegistryConfig 配置 Docker Registry V2 拉穿镜像。
