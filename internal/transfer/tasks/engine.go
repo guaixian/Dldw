@@ -44,6 +44,11 @@ type EngineConfig struct {
 	MaxRetries   int           // default 3
 	RetryBackoff time.Duration // default 2s
 	GCAge        time.Duration // tmp file age before GC, default 1h
+	// FetchFunc allows the app layer to hook around the executor's Fetch
+	// call (e.g. to set/clear progress tracking). Called as:
+	//   begin(taskID) → exec.Fetch(...) → end()
+	BeginFetch func(taskID string)
+	EndFetch   func()
 }
 
 func (c EngineConfig) withDefaults() EngineConfig {
@@ -248,6 +253,11 @@ func (e *Engine) process(taskID string) {
 
 	e.log.Log("task_start", t.ID, "cache_key", t.CacheKey, "family", t.Family, "url", audit.RedactURL(t.URL))
 
+	// 进度钩子：让 app 层知道当前在抓哪个任务
+	if e.cfg.BeginFetch != nil {
+		e.cfg.BeginFetch(t.ID)
+	}
+
 	for {
 		// queued|failed -> downloading
 		if t.Status == StatusQueued || t.Status == StatusFailed {
@@ -313,6 +323,9 @@ func (e *Engine) process(taskID string) {
 			return
 		}
 		e.log.Log("task_ready", t.ID, "cache_key", t.CacheKey, "size", art.Size, "sha256", art.SHA256)
+		if e.cfg.EndFetch != nil {
+			e.cfg.EndFetch()
+		}
 		return
 	}
 }

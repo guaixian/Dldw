@@ -31,12 +31,15 @@ func InjectMirrors(tool string, args []string, env []string, serverBase, token s
 	serverBase = strings.TrimRight(serverBase, "/")
 	// mirrorBase 形如 http://<token>@127.0.0.1:18080（鉴权开启时）
 	mirrorBase := serverBase
+	authToken := ""
 	if caps.MirrorAuth && token != "" {
+		authToken = token
 		if u, err := url.Parse(serverBase); err == nil && u.User == nil {
 			u.User = url.User(token)
 			mirrorBase = u.String()
 		}
 	}
+	_ = authToken
 	pypiURL := mirrorBase + "/pypi/simple"
 	npmURL := mirrorBase + "/npm"
 
@@ -62,10 +65,28 @@ func InjectMirrors(tool string, args []string, env []string, serverBase, token s
 		if caps.GoMod && !goProxyConfigured(env) {
 			toolEnv = []string{"GOPROXY=" + mirrorBase + "/gomod,direct"}
 		}
-	case "npm", "pnpm", "yarn", "bun":
+	case "npm", "bun":
 		if caps.NPM && isReadSubcommand(args, npmReadSubcommands) &&
 			!userSpecifiesIndex(args, env, npmIndexFlags, npmIndexEnv, npmConfigFiles) {
-			// 大小写各一份（npm/pnpm 在不同平台读取的 env 大小写不同）
+			toolEnv = []string{
+				"NPM_CONFIG_REGISTRY=" + npmURL,
+				"npm_config_registry=" + npmURL,
+			}
+		}
+	case "pnpm":
+		// pnpm 11.x 不读 NPM_CONFIG_REGISTRY env 且 fetch 不支持 URL 凭证；
+		// 写入项目级 .npmrc（registry= + _authToken= 两行）
+		if caps.NPM && isReadSubcommand(args, npmReadSubcommands) &&
+			!userSpecifiesIndex(args, env, npmIndexFlags, npmIndexEnv, npmConfigFiles) {
+			if err := ensureNpmrcRegistry(npmURL, tokenForURL(mirrorBase)); err == nil {
+				// 返回一个标记变量（pnpm 靠 .npmrc，不读 env）
+				toolEnv = []string{"DLDW_NPM_MIRROR=1"}
+			}
+		}
+	case "yarn":
+		// yarn 1.x 尊重 env；yarn berry 用 .yarnrc.yml（v1 不注入文件）
+		if caps.NPM && isReadSubcommand(args, npmReadSubcommands) &&
+			!userSpecifiesIndex(args, env, npmIndexFlags, npmIndexEnv, npmConfigFiles) {
 			toolEnv = []string{
 				"NPM_CONFIG_REGISTRY=" + npmURL,
 				"npm_config_registry=" + npmURL,
@@ -81,6 +102,14 @@ func InjectMirrors(tool string, args []string, env []string, serverBase, token s
 	return out
 }
 
+// tokenForURL 从 mirrorBase（可能含 userinfo）提取令牌。
+func tokenForURL(mirrorBase string) string {
+	if u, err := url.Parse(mirrorBase); err == nil && u.User != nil {
+		return u.User.Username()
+	}
+	return ""
+}
+
 func envHas(env []string, key string) bool {
 	for _, kv := range env {
 		eq := strings.IndexByte(kv, '=')
@@ -89,6 +118,52 @@ func envHas(env []string, key string) bool {
 		}
 	}
 	return false
+}
+
+// ensureNpmrcRegistry 在项目目录创建/追加 .npmrc（pnpm 专用）。
+// pnpm 11.x 不读 NPM_CONFIG_REGISTRY env，只认 .npmrc 文件；
+// 且其 fetch 不支持 URL 内嵌凭证，须用 _authToken 行。
+func ensureNpmrcRegistry(registryURL, token string) error {
+	// 去掉 URL 中的 userinfo（pnpm fetch 不支持）
+	plainURL := registryURL
+	if u, err := url.Parse(registryURL); err == nil && u.User != nil {
+		u.User = nil
+		plainURL = u.String()
+	}
+
+	npmrc := filepath.Join(cwd(), ".npmrc")
+	data, err := os.ReadFile(npmrc)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	s := string(data)
+	for _, line := range strings.Split(s, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "registry=") {
+			return nil // 已有 registry，不覆盖
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("registry=" + plainURL + "\n")
+	if token != "" {
+		// npm/pnpm 标准写法：//<host>:<port>/<path>/:_authToken=<token>
+		if u, err := url.Parse(plainURL); err == nil {
+			key := "//" + u.Host + u.Path + "/:_authToken=" + token
+			b.WriteString(key + "\n")
+		}
+	}
+
+	f, err := os.OpenFile(npmrc, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if !strings.HasSuffix(s, "\n") && s != "" {
+		f.WriteString("\n")
+	}
+	_, err = f.WriteString(b.String())
+	return err
 }
 
 var (

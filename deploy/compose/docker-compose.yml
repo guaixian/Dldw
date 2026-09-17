@@ -28,11 +28,11 @@ services:
     restart: unless-stopped
 
     ports:
-      - "8080:8080"   # 控制 API（含 /pypi /npm /mirror /gomod /hf /v2 镜像端点）
-      - "8081:8081"   # DLDW/1 隧道（生产环境建议加 TLS）
+      - "9933:8080"   # 控制 API（含 /pypi /npm /mirror /gomod /hf /v2 镜像端点）
+      - "9934:8081"   # DLDW/1 隧道（生产环境建议加 TLS）
 
     volumes:
-      - dldw-data:/data   # server.yaml + localfs 存储 + 令牌/任务/审计
+      - ./data:/data   # server.yaml + localfs 存储 + 令牌/任务/审计
 
     environment:
       TZ: UTC

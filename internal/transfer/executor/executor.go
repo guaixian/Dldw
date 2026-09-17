@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"dldw/internal/policy/ssrf"
@@ -52,8 +53,12 @@ type BuiltinConfig struct {
 	// UpstreamProxy is an optional http(s):// proxy for ALL origin fetches
 	// (e.g. Xray mixed inbound http://127.0.0.1:10808). When set, target
 	// DNS/SSRF resolution is delegated to the proxy; the port allowlist
-	// above still applies locally.
+	// above still applies locally. Private/loopback targets bypass the
+	// proxy and go direct (a VPS cannot reach your LAN).
 	UpstreamProxy string
+	// ProgressFunc is called with (bytesRead, totalBytes) during download.
+	// totalBytes is -1 when Content-Length is unknown.
+	ProgressFunc func(read, total int64)
 }
 
 // Builtin is the default zero-dependency executor.
@@ -89,11 +94,17 @@ func NewBuiltin(cfg BuiltinConfig) *Builtin {
 		DisableCompression:    true, // artifacts are already compressed; avoid gzip traps
 	}
 	if cfg.UpstreamProxy != "" {
-		// 经上游代理：拨号目标是代理本身（普通 dialer），目标主机的
-		// DNS/SSRF 判定由代理执行；本地仍保留端口白名单（见 fetchOnce）。
+		// 经上游代理：私网/回环目标绕过代理直连（VPS 连不上你的局域网）。
+		// 对域名做 DNS 解析后判定（host.docker.internal 解析为 192.168.x.x）。
 		pu, err := url.Parse(cfg.UpstreamProxy)
 		if err == nil && (pu.Scheme == "http" || pu.Scheme == "https") {
-			tr.Proxy = http.ProxyURL(pu)
+			dnsCache := &hostClassCache{}
+			tr.Proxy = func(req *http.Request) (*url.URL, error) {
+				if dnsCache.isPrivate(req.URL.Hostname()) {
+					return nil, nil // 直连，不走代理
+				}
+				return pu, nil
+			}
 			tr.DialContext = (&net.Dialer{Timeout: 15 * time.Second}).DialContext
 		}
 	} else {
@@ -115,6 +126,12 @@ func NewBuiltin(cfg BuiltinConfig) *Builtin {
 		policy:   policy,
 		proxyURL: cfg.UpstreamProxy,
 	}
+}
+
+// SetProgressFunc sets or updates the progress callback (thread-safe enough
+// for our single-threaded engine usage).
+func (b *Builtin) SetProgressFunc(fn func(read, total int64)) {
+	b.cfg.ProgressFunc = fn
 }
 
 func (b *Builtin) Name() string { return "builtin" }
@@ -194,9 +211,9 @@ func (b *Builtin) fetchOnce(ctx context.Context, rawURL, destDir, hintName strin
 	if resp.StatusCode/100 != 2 {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			return nil, fmt.Errorf("%w: HTTP %d", ErrRetryable, resp.StatusCode)
+			return nil, fmt.Errorf("%w: HTTP %d (url: %s)", ErrRetryable, resp.StatusCode, sanitizeURLForLog(req.URL.String()))
 		}
-		return nil, fmt.Errorf("builtin: HTTP %d for %s", resp.StatusCode, sanitizeURLForLog(rawURL))
+		return nil, fmt.Errorf("builtin: HTTP %d (url: %s)", resp.StatusCode, sanitizeURLForLog(req.URL.String()))
 	}
 
 	name := sanitizeFilename(hintName)
@@ -220,7 +237,11 @@ func (b *Builtin) fetchOnce(ctx context.Context, rawURL, destDir, hintName strin
 	if b.cfg.MaxBytes > 0 {
 		limit = io.LimitReader(resp.Body, b.cfg.MaxBytes+1)
 	}
-	written, err := io.Copy(io.MultiWriter(tmp, h), limit)
+	// 实时进度：包装 body 追踪已读字节数
+	total := resp.ContentLength // -1 if unknown
+	pr := &progressReader{r: limit, total: total, fn: b.cfg.ProgressFunc}
+	written, err := io.Copy(io.MultiWriter(tmp, h), pr)
+	pr.close()
 	if err != nil {
 		tmp.Close()
 		tmp = nil
@@ -275,4 +296,74 @@ func sanitizeURLForLog(u string) string {
 		return u[:i] + "?..."
 	}
 	return u
+}
+
+// hostClassCache caches DNS lookups for proxy bypass decisions.
+type hostClassCache struct {
+	mu    sync.RWMutex
+	known map[string]bool // host -> isPrivate
+}
+
+func (c *hostClassCache) isPrivate(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	}
+	// 常见本地主机名快速路径
+	if host == "host.docker.internal" || host == "localhost" ||
+		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") ||
+		strings.HasSuffix(host, ".lan") || strings.HasSuffix(host, ".home") {
+		return true
+	}
+	c.mu.RLock()
+	v, ok := c.known[host]
+	c.mu.RUnlock()
+	if ok {
+		return v
+	}
+	// DNS 解析后判定（失败时保守返回 false = 走代理）
+	addrs, err := net.LookupHost(host)
+	isPriv := false
+	if err == nil {
+		for _, a := range addrs {
+			if ip := net.ParseIP(a); ip != nil {
+				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+					isPriv = true
+					break
+				}
+			}
+		}
+	}
+	c.mu.Lock()
+	if c.known == nil {
+		c.known = map[string]bool{}
+	}
+	c.known[host] = isPriv
+	c.mu.Unlock()
+	return isPriv
+}
+
+// progressReader wraps a reader and reports bytes read to fn periodically.
+type progressReader struct {
+	r        io.Reader
+	read     int64
+	total    int64 // -1 if unknown
+	fn       func(read, total int64)
+	lastTick time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.read += int64(n)
+	// 每秒最多回调一次，避免小文件刷屏
+	if p.fn != nil && time.Since(p.lastTick) > time.Second {
+		p.lastTick = time.Now()
+		p.fn(p.read, p.total)
+	}
+	return n, err
+}
+
+func (p *progressReader) close() {
+	if p.fn != nil {
+		p.fn(p.read, p.total) // 最终回调
+	}
 }

@@ -137,6 +137,17 @@ func (p *Policy) allowedPorts() []int {
 	return p.Ports
 }
 
+// allowAllPorts reports whether the port list contains the wildcard 0 or -1.
+// 0 / -1 = 放行所有端口（仅限本地/开发环境；公网部署严禁使用）。
+func (p *Policy) allowAllPorts() bool {
+	for _, port := range p.Ports {
+		if port == 0 || port == -1 {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Policy) resolver() *net.Resolver {
 	if p.Resolver == nil {
 		return net.DefaultResolver
@@ -152,16 +163,20 @@ func (p *Policy) dialTimeout() time.Duration {
 }
 
 // CheckPort validates a destination port against the port policy.
+// 列表包含 0 或 -1 时放行所有端口。
 func (p *Policy) CheckPort(port int) error {
 	if port <= 0 || port > 65535 {
 		return &Error{Code: CodePortDenied, Detail: fmt.Sprintf("invalid port %d", port)}
+	}
+	if p.allowAllPorts() {
+		return nil
 	}
 	for _, ap := range p.allowedPorts() {
 		if ap == port {
 			return nil
 		}
 	}
-	return &Error{Code: CodePortDenied, Detail: fmt.Sprintf("port %d not allowed (allowed: %v)", port, p.allowedPorts())}
+	return &Error{Code: CodePortDenied, Detail: fmt.Sprintf("port %d not allowed (allowed: %v; use 0 or -1 for all)", port, p.allowedPorts())}
 }
 
 // CheckHost validates a hostname or IP literal: IP literals are checked

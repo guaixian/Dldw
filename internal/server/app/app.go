@@ -212,14 +212,25 @@ func New(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("unknown executor driver %q", cfg.Executor.Driver)
 	}
 
-	// task engine
+	// task engine（实时进度：executor 每秒回调字节 → 后台协程写任务 Progress）
 	store, err := tasks.NewStore(cfg.TasksFile)
 	if err != nil {
 		return nil, fmt.Errorf("task store: %w", err)
 	}
+	// 进度追踪器：executor 写入，后台协程读出并更新任务
+	prog := &fetchProgress{store: store}
+	if b, ok := a.Exec.(*executor.Builtin); ok {
+		b.SetProgressFunc(func(read, total int64) {
+			prog.update(read, total)
+		})
+	}
+	// 后台协程：每 2 秒把进度写入任务存储（客户端轮询即可看到）
+	go prog.loop()
 	a.Engine = tasks.NewEngine(tasks.EngineConfig{
 		TmpDir:     cfg.TmpDir,
 		PresignTTL: cfg.PresignTTLDuration(),
+		BeginFetch: prog.Begin,
+		EndFetch:   prog.End,
 	}, store, a.Exec, a.Storage, a.Audit)
 
 	// PyPI 拉穿镜像（pypi.enabled 时挂载 /pypi/*）

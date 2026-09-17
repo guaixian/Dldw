@@ -110,7 +110,8 @@ func fallbackAllowed(policy string) bool {
 	return policy == "always"
 }
 
-// pollTask waits for a server-side cache task to become ready.
+// pollTask waits for a server-side cache task to become ready,
+// showing fetch progress while waiting.
 func pollTask(ctx context.Context, api *Client, taskID string, opts Options) (*ResolveResponse, error) {
 	deadline := time.Now().Add(opts.TaskTimeout)
 	if deadline.IsZero() || opts.TaskTimeout <= 0 {
@@ -121,16 +122,24 @@ func pollTask(ctx context.Context, api *Client, taskID string, opts Options) (*R
 		wait = time.Second
 	}
 	var last *TaskView
+	lastPct := -1.0
 	for {
 		t, err := api.Task(ctx, taskID)
 		if err != nil {
 			return nil, err
 		}
 		last = t
+		pct := t.Progress * 100
 		switch t.Status {
 		case "ready":
+			if lastPct >= 0 {
+				fmt.Fprintf(os.Stderr, "\r\033[K") // 清除进度行
+			}
 			return api.Refresh(ctx, taskID)
 		case "dead":
+			if lastPct >= 0 {
+				fmt.Fprintf(os.Stderr, "\r\033[K")
+			}
 			return nil, fmt.Errorf("E_TASK_DEAD: server could not fetch artifact: %s", t.Error)
 		case "failed":
 			if t.Retries > 8 {
@@ -139,6 +148,17 @@ func pollTask(ctx context.Context, api *Client, taskID string, opts Options) (*R
 		}
 		if time.Now().After(deadline) {
 			break
+		}
+		// 显示服务端抓取进度（百分比 + 字节数）
+		if pct != lastPct && pct > 0 {
+			statusHint := t.Status
+			if t.Artifact != nil && t.Artifact.Size > 0 {
+				fmt.Fprintf(os.Stderr, "\rdldw: server fetching %s/%s (%.0f%%, %s)",
+					formatBytes(int64(pct/100*float64(t.Artifact.Size))), formatBytes(t.Artifact.Size), pct, statusHint)
+			} else {
+				fmt.Fprintf(os.Stderr, "\rdldw: server fetching... %.0f%% (%s)", pct, statusHint)
+			}
+			lastPct = pct
 		}
 		select {
 		case <-ctx.Done():
@@ -417,6 +437,19 @@ func ResumeState(output string) (bool, int64) {
 		return false, 0
 	}
 	return true, fi.Size()
+}
+
+// formatBytes renders byte counts for progress display.
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fG", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fM", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fK", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%dB", n)
 }
 
 // DefaultOutputName exposes naming for the CLI.

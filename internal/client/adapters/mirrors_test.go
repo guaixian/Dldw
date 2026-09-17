@@ -91,6 +91,12 @@ func TestInjectNPM(t *testing.T) {
 	caps := MirrorCaps{NPM: true}
 	base := "http://127.0.0.1:18080"
 
+	// 隔离 cwd（避免本机 .npmrc 影响判定）
+	cleanDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(cleanDir)
+	defer os.Chdir(oldWd)
+
 	got := InjectMirrors("npm", []string{"install", "left-pad"}, baseEnv(), base, "", caps)
 	if len(got) != 2 || got[0] != "NPM_CONFIG_REGISTRY=http://127.0.0.1:18080/npm" {
 		t.Fatalf("npm inject = %v", got)
@@ -111,12 +117,17 @@ func TestInjectNPM(t *testing.T) {
 		t.Fatal("user npm_config_registry (case-insensitive) should win")
 	}
 
-	// pnpm/yarn/bun 同样注入（在写 .npmrc 之前测，避免目录污染）
+	// yarn 先测（pnpm 会写 .npmrc 影响后续判定）
+	if InjectMirrors("yarn", []string{"install"}, baseEnv(), base, "", caps) == nil {
+		t.Fatal("yarn should inject")
+	}
 	if InjectMirrors("pnpm", []string{"install"}, baseEnv(), base, "", caps) == nil {
 		t.Fatal("pnpm should inject")
 	}
+	// pnpm 注入会写 .npmrc，验证后清理（不影响后续测试）
+	os.Remove(filepath.Join(cleanDir, ".npmrc"))
 	if InjectMirrors("yarn", []string{"install"}, baseEnv(), base, "", caps) == nil {
-		t.Fatal("yarn should inject")
+		t.Fatal("yarn should inject after pnpm cleanup")
 	}
 
 	// 项目 .npmrc 声明 registry -> 不注入
